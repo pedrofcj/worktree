@@ -13,13 +13,27 @@ All contributions and comments are welcome, as long as you are respectful. I wan
 
 ## Installation
 
-Source the script for your shell. For PowerShell:
+Source the script for your shell and add it to your shell profile to load automatically on every session.
 
+**PowerShell** — add to `$PROFILE`:
 ```powershell
 . /path/to/pwsh/worktree.ps1
 ```
 
-Add this line to your `$PROFILE` to load it automatically on every session.
+**Bash** — add to `~/.bashrc`:
+```bash
+source /path/to/bash/worktree.sh
+```
+
+**Zsh** — add to `~/.zshrc`:
+```bash
+source /path/to/zsh/worktree.sh
+```
+
+**Nushell** — add to `$nu.config-path`:
+```nu
+source /path/to/nushell/worktree.nu
+```
 
 ## Commands
 
@@ -51,7 +65,14 @@ By default the command is `wt`. To change it, use either:
 
 **Environment variable:**
 ```powershell
+# PowerShell
 $env:WT_RENAME = "gw"
+
+# Bash / Zsh
+export WT_RENAME="gw"
+
+# Nushell
+$env.WT_RENAME = "gw"
 ```
 
 **Config file** (`~/.wtconfig`):

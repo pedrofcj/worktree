@@ -26,6 +26,7 @@ _wt_last_progress_length=0
 _wt_project_dir=""
 _wt_project_name=""
 _wt_worktree_parent=""
+_wt_command_name=""
 
 # ============================================================================
 # Progress helpers
@@ -64,7 +65,7 @@ _wt_progress_complete() {
 # ============================================================================
 
 # Parse git worktree list --porcelain into tab-separated records
-# Output: wt_path\tbranch\tname (one line per non-bare worktree)
+# Output: wt_path\tbranch\tname\tis_bare (one line per worktree)
 _wt_get_parsed_worktrees() {
     local repo_path="${1:-$_wt_project_dir}"
     local output
@@ -75,9 +76,9 @@ _wt_get_parsed_worktrees() {
 
     while IFS= read -r line; do
         if [[ "$line" == worktree\ * ]]; then
-            # Emit previous record if exists (skip bare repos)
-            if [[ -n "$wt_path" && "$is_bare" != "true" ]]; then
-                printf '%s\t%s\t%s\n' "$wt_path" "$branch" "${wt_path##*/}"
+            # Emit previous record if exists
+            if [[ -n "$wt_path" ]]; then
+                printf '%s\t%s\t%s\t%s\n' "$wt_path" "$branch" "${wt_path##*/}" "$is_bare"
             fi
             wt_path="${line#worktree }"
             branch=""
@@ -89,9 +90,9 @@ _wt_get_parsed_worktrees() {
         fi
     done <<< "$output"
 
-    # Emit last record (skip bare repos)
-    if [[ -n "$wt_path" && "$is_bare" != "true" ]]; then
-        printf '%s\t%s\t%s\n' "$wt_path" "$branch" "${wt_path##*/}"
+    # Emit last record
+    if [[ -n "$wt_path" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$wt_path" "$branch" "${wt_path##*/}" "$is_bare"
     fi
 }
 
@@ -207,12 +208,14 @@ _wt_get_git_root() {
 # ============================================================================
 
 _wt_help() {
+    local cmd="$_wt_command_name"
+    [[ -z "$cmd" ]] && cmd="wt"
     printf '%s\n' "$(_blue "=== Git Worktree Manager ===")"
     echo
-    printf '%s%s\n' "$(_cyan "Usage: ")" "$(_yellow "wt <command>")"
+    printf '%s%s\n' "$(_cyan "Usage: ")" "$(_yellow "${cmd} <command>")"
     echo
     printf '%s\n' "$(_cyan "Commands:")"
-    printf '  %s     %s\n' "$(_green "add <name> [type]")" "Create a new worktree (type defaults to 'feature')"
+    printf '  %s\n                          %s\n' "$(_green "add <name> [type] [--from <worktree>]")" "Create a new worktree (type defaults to 'feature')"
     printf '  %s                %s\n' "$(_green "list")" "List all worktrees"
     printf '  %s       %s\n' "$(_green "remove <name>")" "Remove a specific worktree"
     printf '  %s          %s\n' "$(_green "remove-all")" "Remove all worktrees (with confirmation)"
@@ -224,16 +227,18 @@ _wt_help() {
     echo "  - Branch name format: <type>/<name> (default type is 'feature')"
     echo "  - If the branch doesn't exist, it creates a new branch"
     echo "  - If the branch already exists, it checks out the existing branch"
+    echo "  - Use --from to base the new branch on another worktree's branch"
     echo
     printf '%s\n' "$(_cyan "Examples:")"
-    printf '  %s\n    %s\n' "$(_yellow "wt add RDUCH-123-add-serialization")" "# Creates trees/RDUCH-123-add-serialization with branch feature/RDUCH-123-add-serialization"
-    printf '  %s\n    %s\n' "$(_yellow "wt add RTJK-1223332-whatever bug")" "# Creates trees/RTJK-1223332-whatever with branch bug/RTJK-1223332-whatever"
-    printf '  %s\n    %s\n' "$(_yellow "wt add look-at-this wowdude")" "# Creates trees/look-at-this with branch wowdude/look-at-this"
-    printf '  %s  %s\n' "$(_yellow "wt list")" "# List all worktrees (shows current with ${_WT_STAR})"
-    printf '  %s  %s\n' "$(_yellow "wt remove my-feature")" "# Remove specific worktree"
-    printf '  %s  %s\n' "$(_yellow "wt remove-all")" "# Remove all worktrees"
-    printf '  %s  %s\n' "$(_yellow "wt fix-fetch")" "# Fix fetch refspec configuration"
-    printf '  %s\n    %s\n' "$(_yellow "wt clone https://github.com/user/repo.git")" "# Clone repo as bare and set up main worktree"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RDUCH-123-add-serialization")" "# Creates trees/RDUCH-123-add-serialization with branch feature/RDUCH-123-add-serialization"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RTJK-1223332-whatever bug")" "# Creates trees/RTJK-1223332-whatever with branch bug/RTJK-1223332-whatever"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add look-at-this wowdude")" "# Creates trees/look-at-this with branch wowdude/look-at-this"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add my-fix --from other-tree")" "# Creates trees/my-fix branching from other-tree's branch"
+    printf '  %s  %s\n' "$(_yellow "${cmd} list")" "# List all worktrees (shows current with ${_WT_STAR})"
+    printf '  %s  %s\n' "$(_yellow "${cmd} remove my-feature")" "# Remove specific worktree"
+    printf '  %s  %s\n' "$(_yellow "${cmd} remove-all")" "# Remove all worktrees"
+    printf '  %s  %s\n' "$(_yellow "${cmd} fix-fetch")" "# Fix fetch refspec configuration"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} clone https://github.com/user/repo.git")" "# Clone repo as bare and set up main worktree"
     echo
 }
 
@@ -259,8 +264,11 @@ _wt_list() {
         return
     fi
 
-    local wt_path branch name
-    while IFS=$'\t' read -r wt_path branch name; do
+    local wt_path branch name is_bare
+    while IFS=$'\t' read -r wt_path branch name is_bare; do
+        # Skip bare repositories
+        [[ "$is_bare" == "true" ]] && continue
+
         if ! $has_worktrees; then
             printf '%s\n' "$(_cyan "Worktrees:")"
             has_worktrees=true
@@ -295,31 +303,58 @@ _wt_init_main_worktree() {
     local detected_branch
     detected_branch=$(_wt_get_default_branch)
 
-    # Check if worktree for default branch already exists
-    if [[ -n "$detected_branch" ]]; then
-        local detected_path="${_wt_worktree_parent}/${detected_branch}"
-        if [[ -d "$detected_path" ]]; then
-            main_path="$detected_path"
-            main_branch="$detected_branch"
-        fi
-    fi
+    # Check if a worktree for the default branch already exists (at any location)
+    local worktrees
+    worktrees=$(_wt_get_parsed_worktrees)
 
-    # Fallback: check common branch names
-    if [[ -z "$main_path" ]]; then
-        local b
-        for b in main master develop trunk; do
-            local bp="${_wt_worktree_parent}/${b}"
-            if [[ -d "$bp" ]]; then
-                main_path="$bp"
-                main_branch="$b"
+    if [[ -n "$detected_branch" && -n "$worktrees" ]]; then
+        local wt_path branch name is_bare
+        while IFS=$'\t' read -r wt_path branch name is_bare; do
+            [[ "$is_bare" == "true" ]] && continue
+            if [[ "$branch" == "$detected_branch" ]]; then
+                main_path="$wt_path"
+                main_branch="$detected_branch"
                 break
             fi
+        done <<< "$worktrees"
+    fi
+
+    # Fallback: check for common branch names if no worktree found yet
+    if [[ -z "$main_path" && -n "$worktrees" ]]; then
+        local b
+        for b in main master develop trunk; do
+            local wt_path branch name is_bare
+            while IFS=$'\t' read -r wt_path branch name is_bare; do
+                [[ "$is_bare" == "true" ]] && continue
+                if [[ "$branch" == "$b" ]]; then
+                    main_path="$wt_path"
+                    main_branch="$b"
+                    break 2
+                fi
+            done <<< "$worktrees"
         done
     fi
 
     # No existing worktree found - create one
     if [[ -z "$main_path" ]]; then
         printf '%s\n' "$(_yellow "Default branch worktree doesn't exist. Creating it...")"
+
+        # If default branch wasn't detected, fix refspec and retry
+        # (handles bare repos cloned with git clone --bare instead of wt clone)
+        if [[ -z "$detected_branch" ]]; then
+            _wt_set_fetch_refspec "$_wt_project_dir" "true"
+
+            _wt_progress_start "Fetching all branches from bare repository"
+            git -C "$_wt_project_dir" fetch --all &>/dev/null
+            if [[ $? -eq 0 ]]; then
+                _wt_progress_complete "Fetched all branches" "success"
+            else
+                _wt_progress_complete "Failed to fetch branches" "warning"
+            fi
+
+            detected_branch=$(_wt_get_default_branch)
+        fi
+
         _wt_progress_start "Detecting default branch"
 
         mkdir -p "$_wt_worktree_parent"
@@ -373,23 +408,93 @@ _wt_init_main_worktree() {
 
 # Create worktree
 _wt_add() {
-    local worktree_name="$1"
-    local branch_type="${2:-$_WT_DEFAULT_BRANCH_TYPE}"
+    # Parse --from flag from arguments
+    local from_worktree=""
+    local -a positional_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from)
+                if [[ -n "${2:-}" ]]; then
+                    from_worktree="$2"
+                    shift 2
+                else
+                    printf '%s\n' "$(_red "${_WT_CROSS} Error: --from requires a worktree name")"
+                    return 1
+                fi
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local worktree_name="${positional_args[1]:-}"
+    local branch_type="${positional_args[2]:-$_WT_DEFAULT_BRANCH_TYPE}"
 
     if [[ -z "$worktree_name" ]]; then
         printf '%s\n' "$(_red "${_WT_CROSS} Error: Please specify a name for the worktree")"
-        printf '%s\n' "$(_yellow "   Usage: wt add <name> [type]")"
+        printf '%s\n' "$(_yellow "   Usage: ${_wt_command_name} add <name> [type] [--from <worktree>]")"
         return 1
     fi
 
-    # Ensure main worktree exists and is updated
-    echo
-    printf '%s\n' "$(_cyan "=== Ensuring main worktree is up to date ===")"
-    if ! _wt_init_main_worktree; then
-        printf '%s\n' "$(_red "${_WT_CROSS} Failed to ensure main worktree. Aborting.")"
-        return 1
+    # Resolve --from source branch
+    local start_point=""
+    if [[ -n "$from_worktree" ]]; then
+        # When branching from another worktree, update that worktree instead of the default branch
+        echo
+        printf '%s\n' "$(_cyan "=== Ensuring source worktree '${from_worktree}' is up to date ===")"
+
+        local worktrees
+        worktrees=$(_wt_get_parsed_worktrees)
+
+        local found_source=false
+        local wt_path branch name is_bare
+        while IFS=$'\t' read -r wt_path branch name is_bare; do
+            [[ "$is_bare" == "true" ]] && continue
+            if [[ "$name" == "$from_worktree" ]]; then
+                start_point="$branch"
+                found_source=true
+
+                # Fetch all from bare repo
+                _wt_progress_start "Fetching all branches from bare repository"
+                git -C "$_wt_project_dir" fetch --all &>/dev/null
+                if [[ $? -eq 0 ]]; then
+                    _wt_progress_complete "Fetched all branches" "success"
+                else
+                    _wt_progress_complete "Failed to fetch all branches (continuing anyway)" "warning"
+                fi
+
+                # Pull the source worktree
+                _wt_progress_start "Updating source worktree '${from_worktree}'"
+                git -C "$wt_path" pull &>/dev/null
+                if [[ $? -eq 0 ]]; then
+                    _wt_progress_complete "Source worktree '${from_worktree}' updated" "success"
+                else
+                    _wt_progress_complete "Failed to pull source worktree (continuing anyway)" "warning"
+                fi
+
+                break
+            fi
+        done <<< "$worktrees"
+
+        if ! $found_source; then
+            printf '%s\n' "$(_red "${_WT_CROSS} Error: Source worktree '${from_worktree}' not found")"
+            printf '%s\n' "$(_yellow "   Run '${_wt_command_name} list' to see available worktrees")"
+            return 1
+        fi
+        echo
+    else
+        # Ensure main worktree exists and is updated
+        echo
+        printf '%s\n' "$(_cyan "=== Ensuring main worktree is up to date ===")"
+        if ! _wt_init_main_worktree; then
+            printf '%s\n' "$(_red "${_WT_CROSS} Failed to ensure main worktree. Aborting.")"
+            return 1
+        fi
+        echo
     fi
-    echo
 
     # Branch name: {type}/{name}
     local branch_name="${branch_type}/${worktree_name}"
@@ -405,12 +510,18 @@ _wt_add() {
     printf '%s\n' "$(_green "=== Creating worktree '${worktree_name}' ===")"
     printf '%s\n' "$(_cyan "   Branch: ${branch_name}")"
     printf '%s\n' "$(_cyan "   Path: ${worktree_path}")"
+    if [[ -n "$start_point" ]]; then
+        printf '%s\n' "$(_cyan "   From: ${from_worktree} (branch: ${start_point})")"
+    fi
     echo
 
     mkdir -p "$_wt_worktree_parent"
 
     # Check if branch already exists
     if _wt_branch_exists "$branch_name"; then
+        if [[ -n "$start_point" ]]; then
+            printf '%s\n' "$(_yellow "${_WT_WARNING} Branch '${branch_name}' already exists, --from flag will be ignored")"
+        fi
         printf '%s\n' "$(_blue "${_WT_SEARCH} Branch '${branch_name}' already exists. Creating worktree from existing branch...")"
         _wt_progress_start "Creating worktree"
         git -C "$_wt_project_dir" worktree add "$worktree_path" "$branch_name" &>/dev/null
@@ -422,7 +533,11 @@ _wt_add() {
         fi
     else
         _wt_progress_start "Creating worktree"
-        git -C "$_wt_project_dir" worktree add -b "$branch_name" "$worktree_path" &>/dev/null
+        if [[ -n "$start_point" ]]; then
+            git -C "$_wt_project_dir" worktree add -b "$branch_name" "$worktree_path" "$start_point" &>/dev/null
+        else
+            git -C "$_wt_project_dir" worktree add -b "$branch_name" "$worktree_path" &>/dev/null
+        fi
         if [[ $? -eq 0 ]]; then
             _wt_progress_complete "Worktree created" "success"
         else
@@ -443,8 +558,11 @@ _wt_add() {
     printf '%s\n' "$(_cyan "   ${worktree_path}")"
     printf '%s\n' "$(_cyan "   Branch: ${branch_name}")"
     echo
-    printf '%s\n' "$(_yellow "To navigate to your new worktree, run:")"
-    echo "   cd ${worktree_path}"
+
+    read -r "response?Do you want to navigate to the new worktree? (Y/n) "
+    if [[ ! "$response" =~ ^[Nn]$ ]]; then
+        cd "$worktree_path"
+    fi
 }
 
 # Remove a specific worktree
@@ -453,14 +571,28 @@ _wt_remove() {
 
     if [[ -z "$name" ]]; then
         printf '%s\n' "$(_red "${_WT_CROSS} Error: Please specify which worktree to remove")"
-        printf '%s\n' "$(_yellow "   Usage: wt remove <worktree-name>")"
+        printf '%s\n' "$(_yellow "   Usage: ${_wt_command_name} remove <worktree-name>")"
         return 1
     fi
 
-    local worktree_path="${_wt_worktree_parent}/${name}"
+    # Look up the worktree from git's worktree list by name (handles any location)
+    local worktrees
+    worktrees=$(_wt_get_parsed_worktrees)
 
-    if [[ ! -d "$worktree_path" ]]; then
-        printf '%s\n' "$(_red "${_WT_CROSS} Error: Worktree '${name}' not found at ${worktree_path}")"
+    local worktree_path="" branch_name=""
+    local wt_path branch wt_name is_bare
+    while IFS=$'\t' read -r wt_path branch wt_name is_bare; do
+        [[ "$is_bare" == "true" ]] && continue
+        if [[ "$wt_name" == "$name" ]]; then
+            worktree_path="$wt_path"
+            branch_name="$branch"
+            break
+        fi
+    done <<< "$worktrees"
+
+    if [[ -z "$worktree_path" ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Error: Worktree '${name}' not found")"
+        printf '%s\n' "$(_yellow "   Run '${_wt_command_name} list' to see available worktrees")"
         return 1
     fi
 
@@ -474,19 +606,6 @@ _wt_remove() {
         printf '%s\n' "$(_yellow "   The default branch worktree is the baseline for all other worktrees.")"
         return 1
     fi
-
-    # Get the branch name associated with this worktree
-    local branch_name=""
-    local worktrees
-    worktrees=$(_wt_get_parsed_worktrees)
-
-    local wt_path wt_branch wt_name
-    while IFS=$'\t' read -r wt_path wt_branch wt_name; do
-        if [[ "$wt_path" == "$worktree_path" ]]; then
-            branch_name="$wt_branch"
-            break
-        fi
-    done <<< "$worktrees"
 
     # Additional check: protect if the branch is the default branch
     if [[ -n "$branch_name" && "$branch_name" == "$default_branch" ]]; then
@@ -525,12 +644,12 @@ _wt_remove_all() {
     worktrees=$(_wt_get_parsed_worktrees)
     default_branch=$(_wt_get_default_branch)
 
-    # Collect removable worktrees (skip outside trees/, skip default branch)
+    # Collect all non-bare worktrees, excluding the default branch
     local -a rm_paths=() rm_names=() rm_branches=()
 
-    local wt_path branch name
-    while IFS=$'\t' read -r wt_path branch name; do
-        [[ "$wt_path" != "${_wt_worktree_parent}/"* ]] && continue
+    local wt_path branch name is_bare
+    while IFS=$'\t' read -r wt_path branch name is_bare; do
+        [[ "$is_bare" == "true" ]] && continue
         [[ "$branch" == "$default_branch" || "$name" == "$default_branch" ]] && continue
 
         rm_paths+=("$wt_path")
@@ -593,7 +712,7 @@ _wt_clone() {
 
     if [[ -z "$repo_url" ]]; then
         printf '%s\n' "$(_red "${_WT_CROSS} Error: Please specify a repository URL")"
-        printf '%s\n' "$(_yellow "   Usage: wt clone <url>")"
+        printf '%s\n' "$(_yellow "   Usage: ${_wt_command_name} clone <url>")"
         return 1
     fi
 
@@ -646,7 +765,7 @@ _wt_clone() {
     if [[ -z "$main_branch" ]]; then
         _wt_progress_complete "Failed to detect default branch" "error"
         printf '%s\n' "$(_yellow "   The repository was cloned but no worktree was created.")"
-        printf '%s\n' "$(_yellow "   You can manually create a worktree using: wt add <name>")"
+        printf '%s\n' "$(_yellow "   You can manually create a worktree using: ${_wt_command_name} add <name>")"
         return 1
     fi
     _wt_progress_complete "Found default branch: ${main_branch}" "success"
@@ -769,8 +888,29 @@ wt() {
         fix-fetch)  _wt_fix_fetch ;;
         *)
             printf '%s\n' "$(_red "${_WT_CROSS} Error: Unknown command '${cmd}'")"
-            printf '%s\n' "$(_yellow "   Run 'wt --help' to see available commands")"
+            printf '%s\n' "$(_yellow "   Run '${_wt_command_name} --help' to see available commands")"
             return 1
             ;;
     esac
 }
+
+# ============================================================================
+# Configurable command name
+# ============================================================================
+
+# Resolve command name: env var > ~/.wtconfig file > default 'wt'
+_wt_command_name="${WT_RENAME:-}"
+if [[ -z "$_wt_command_name" && -f "${HOME}/.wtconfig" ]]; then
+    while IFS= read -r _wt_cfg_line; do
+        if [[ "$_wt_cfg_line" =~ ^[[:space:]]*command_name[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
+            _wt_command_name="${match[1]}"
+            break
+        fi
+    done < "${HOME}/.wtconfig"
+fi
+[[ -z "$_wt_command_name" ]] && _wt_command_name="wt"
+
+# If a custom name is configured, create a wrapper function
+if [[ "$_wt_command_name" != "wt" ]]; then
+    eval "${_wt_command_name}() { wt \"\$@\"; }"
+fi

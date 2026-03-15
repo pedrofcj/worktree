@@ -49,14 +49,40 @@ def get-git-root [] {
     return null
 }
 
-# Build a context record { project_dir, project_name, worktree_parent }.
+# Resolve the command name from $env.WT_RENAME, ~/.wtconfig, or default "wt".
+def resolve-command-name [] {
+    # Check env var first
+    if "WT_RENAME" in $env and ($env.WT_RENAME | str trim) != "" {
+        return ($env.WT_RENAME | str trim)
+    }
+
+    # Check ~/.wtconfig file
+    let config_path = ($nu.home-path | path join ".wtconfig")
+    if ($config_path | path exists) {
+        let lines = (open $config_path | lines)
+        for line in $lines {
+            let m = ($line | parse --regex '^\s*command_name\s*=\s*(?P<val>.+)\s*$')
+            if not ($m | is-empty) {
+                let val = ($m | first | get val | str trim)
+                if $val != "" {
+                    return $val
+                }
+            }
+        }
+    }
+
+    "wt"
+}
+
+# Build a context record { project_dir, project_name, worktree_parent, cmd }.
 # Returns null when not in a bare repo.
 def wt-context [] {
     let root = (get-git-root)
     if $root == null { return null }
     let name = ($root | path basename)
     let parent = ($root | path join $WORKTREE_FOLDER)
-    { project_dir: $root, project_name: $name, worktree_parent: $parent }
+    let cmd = (resolve-command-name)
+    { project_dir: $root, project_name: $name, worktree_parent: $parent, cmd: $cmd }
 }
 
 # Parse `git worktree list` into structured records.
@@ -149,23 +175,31 @@ def ensure-main-worktree [project_dir: string, worktree_parent: string] {
     mut main_branch: string = ""
     mut created = false
 
-    let detected = (default-branch $project_dir)
+    mut detected = (default-branch $project_dir)
 
-    # Check if a worktree for the detected default branch already exists
+    # Check if a worktree for the detected default branch already exists (at any location)
+    let parsed_worktrees = (parse-worktrees $project_dir)
+
     if $detected != null {
-        let detected_path = ($worktree_parent | path join $detected)
-        if ($detected_path | path exists) {
-            $main_path = $detected_path
+        let matched = (
+            $parsed_worktrees
+            | where { |wt| $wt.branch == $detected and (not $wt.is_bare) }
+        )
+        if not ($matched | is-empty) {
+            $main_path = ($matched | first | get path)
             $main_branch = $detected
         }
     }
 
-    # Fallback: check common branch names
+    # Fallback: check common branch names by matching branch in worktree list
     if $main_path == "" {
         for branch in ["main" "master" "develop" "trunk"] {
-            let bp = ($worktree_parent | path join $branch)
-            if ($bp | path exists) {
-                $main_path = $bp
+            let matched = (
+                $parsed_worktrees
+                | where { |wt| $wt.branch == $branch and (not $wt.is_bare) }
+            )
+            if not ($matched | is-empty) {
+                $main_path = ($matched | first | get path)
                 $main_branch = $branch
                 break
             }
@@ -175,6 +209,22 @@ def ensure-main-worktree [project_dir: string, worktree_parent: string] {
     # No existing worktree — create one
     if $main_path == "" {
         print $"(ansi yellow)Default branch worktree doesn't exist. Creating it...(ansi reset)"
+
+        # If default branch wasn't detected, fix refspec and retry (handles bare repos cloned without wt)
+        if $detected == null {
+            set-fetch-refspec $project_dir --silent | ignore
+
+            print "  Fetching all branches from bare repository..."
+            let fetch = (^git -C $project_dir fetch --all | complete)
+            if $fetch.exit_code == 0 {
+                print $"(ansi green)  ($CHECK) Fetched all branches(ansi reset)"
+            } else {
+                print $"(ansi yellow)  ($WARNING) Failed to fetch branches(ansi reset)"
+            }
+
+            $detected = (default-branch $project_dir)
+        }
+
         print "  Detecting default branch..."
 
         mkdir $worktree_parent
@@ -231,12 +281,14 @@ def ensure-main-worktree [project_dir: string, worktree_parent: string] {
 
 # Show styled help with examples
 export def wt [] {
+    let cmd = (resolve-command-name)
     print $"(ansi blue)=== Git Worktree Manager ===(ansi reset)"
     print ""
-    print $"(ansi cyan)Usage: (ansi yellow)wt <command>(ansi reset)"
+    print $"(ansi cyan)Usage: (ansi yellow)($cmd) <command>(ansi reset)"
     print ""
     print $"(ansi cyan)Commands:(ansi reset)"
-    print $"  (ansi green)add <name> [type](ansi reset)     Create a new worktree \(type defaults to 'feature'\)"
+    print $"  (ansi green)add <name> [type] [--from <worktree>](ansi reset)"
+    print "                          Create a new worktree (type defaults to 'feature')"
     print $"  (ansi green)list(ansi reset)                List all worktrees"
     print $"  (ansi green)remove <name>(ansi reset)       Remove a specific worktree"
     print $"  (ansi green)remove-all(ansi reset)          Remove all worktrees \(with confirmation\)"
@@ -248,16 +300,18 @@ export def wt [] {
     print "  • Branch name format: <type>/<name> (default type is 'feature')"
     print "  • If the branch doesn't exist, it creates a new branch"
     print "  • If the branch already exists, it checks out the existing branch"
+    print "  • Use --from to base the new branch on another worktree's branch"
     print ""
     print $"(ansi cyan)Examples:(ansi reset)"
-    print $"  (ansi yellow)wt add RDUCH-123-add-serialization(ansi reset)     # branch feature/RDUCH-123-add-serialization"
-    print $"  (ansi yellow)wt add RTJK-1223332-whatever bug(ansi reset)    # branch bug/RTJK-1223332-whatever"
-    print $"  (ansi yellow)wt add look-at-this wowdude(ansi reset)          # branch wowdude/look-at-this"
-    print $"  (ansi yellow)wt list(ansi reset)                              # List all worktrees \(★ = current\)"
-    print $"  (ansi yellow)wt remove my-feature(ansi reset)                 # Remove specific worktree"
-    print $"  (ansi yellow)wt remove-all(ansi reset)                        # Remove all worktrees"
-    print $"  (ansi yellow)wt fix-fetch(ansi reset)                        # Fix fetch refspec configuration"
-    print $"  (ansi yellow)wt clone https://github.com/user/repo.git(ansi reset)  # Clone as bare + main worktree"
+    print $"  (ansi yellow)($cmd) add RDUCH-123-add-serialization(ansi reset)     # branch feature/RDUCH-123-add-serialization"
+    print $"  (ansi yellow)($cmd) add RTJK-1223332-whatever bug(ansi reset)    # branch bug/RTJK-1223332-whatever"
+    print $"  (ansi yellow)($cmd) add look-at-this wowdude(ansi reset)          # branch wowdude/look-at-this"
+    print $"  (ansi yellow)($cmd) add my-fix --from other-tree(ansi reset)          # Creates trees/my-fix branching from other-tree's branch"
+    print $"  (ansi yellow)($cmd) list(ansi reset)                              # List all worktrees \(★ = current\)"
+    print $"  (ansi yellow)($cmd) remove my-feature(ansi reset)                 # Remove specific worktree"
+    print $"  (ansi yellow)($cmd) remove-all(ansi reset)                        # Remove all worktrees"
+    print $"  (ansi yellow)($cmd) fix-fetch(ansi reset)                        # Fix fetch refspec configuration"
+    print $"  (ansi yellow)($cmd) clone https://github.com/user/repo.git(ansi reset)  # Clone as bare + main worktree"
     print ""
 }
 
@@ -265,17 +319,59 @@ export def wt [] {
 export def "wt add" [
     name: string       # Worktree directory name
     type: string = "feature"  # Branch type prefix (feature, bug, etc.)
+    --from: string = ""  # Source worktree name to branch from
 ] {
     let ctx = (wt-context)
     if $ctx == null { return }
 
-    print ""
-    print $"(ansi cyan)=== Ensuring main worktree is up to date ===(ansi reset)"
-    if not (ensure-main-worktree $ctx.project_dir $ctx.worktree_parent) {
-        print $"(ansi red)($CROSS) Failed to ensure main worktree. Aborting.(ansi reset)"
-        return
+    mut start_point: string = ""
+
+    if $from != "" {
+        # --from mode: update the source worktree instead of the default branch
+        print ""
+        print $"(ansi cyan)=== Ensuring source worktree '($from)' is up to date ===(ansi reset)"
+
+        let parsed_worktrees = (parse-worktrees $ctx.project_dir)
+        let source_matches = (
+            $parsed_worktrees
+            | where { |wt| $wt.name == $from and (not $wt.is_bare) }
+        )
+        if ($source_matches | is-empty) {
+            print $"(ansi red)($CROSS) Error: Source worktree '($from)' not found(ansi reset)"
+            print $"(ansi yellow)   Run '($ctx.cmd) list' to see available worktrees(ansi reset)"
+            return
+        }
+        let source_wt = ($source_matches | first)
+        $start_point = ($source_wt.branch | default "")
+
+        # Fetch all from bare repo
+        print "  Fetching all branches from bare repository..."
+        let fetch = (^git -C $ctx.project_dir fetch --all | complete)
+        if $fetch.exit_code == 0 {
+            print $"(ansi green)  ($CHECK) Fetched all branches(ansi reset)"
+        } else {
+            print $"(ansi yellow)  ($WARNING) Failed to fetch all branches \(continuing anyway\)(ansi reset)"
+        }
+
+        # Pull the source worktree
+        print $"  Updating source worktree '($from)'..."
+        let pull = (^git -C $source_wt.path pull | complete)
+        if $pull.exit_code == 0 {
+            print $"(ansi green)  ($CHECK) Source worktree '($from)' updated(ansi reset)"
+        } else {
+            print $"(ansi yellow)  ($WARNING) Failed to pull source worktree \(continuing anyway\)(ansi reset)"
+        }
+        print ""
+    } else {
+        # Standard mode: ensure main worktree is up to date
+        print ""
+        print $"(ansi cyan)=== Ensuring main worktree is up to date ===(ansi reset)"
+        if not (ensure-main-worktree $ctx.project_dir $ctx.worktree_parent) {
+            print $"(ansi red)($CROSS) Failed to ensure main worktree. Aborting.(ansi reset)"
+            return
+        }
+        print ""
     }
-    print ""
 
     let branch_name = $"($type)/($name)"
     let worktree_path = ($ctx.worktree_parent | path join $name)
@@ -289,11 +385,17 @@ export def "wt add" [
     print $"(ansi green)=== Creating worktree '($name)' ===(ansi reset)"
     print $"(ansi cyan)   Branch: ($branch_name)(ansi reset)"
     print $"(ansi cyan)   Path: ($worktree_path)(ansi reset)"
+    if $start_point != "" {
+        print $"(ansi cyan)   From: ($from) \(branch: ($start_point)\)(ansi reset)"
+    }
     print ""
 
     mkdir $ctx.worktree_parent
 
     if (branch-exists $branch_name $ctx.project_dir) {
+        if $start_point != "" {
+            print $"(ansi yellow)($WARNING) Branch '($branch_name)' already exists, --from flag will be ignored(ansi reset)"
+        }
         print $"(ansi blue)($SEARCH) Branch '($branch_name)' already exists. Creating worktree from existing branch...(ansi reset)"
         print "  Creating worktree..."
         let result = (^git -C $ctx.project_dir worktree add $worktree_path $branch_name | complete)
@@ -304,7 +406,11 @@ export def "wt add" [
         print $"(ansi green)  ($CHECK) Worktree created(ansi reset)"
     } else {
         print "  Creating worktree..."
-        let result = (^git -C $ctx.project_dir worktree add -b $branch_name $worktree_path | complete)
+        let result = if $start_point != "" {
+            (^git -C $ctx.project_dir worktree add -b $branch_name $worktree_path $start_point | complete)
+        } else {
+            (^git -C $ctx.project_dir worktree add -b $branch_name $worktree_path | complete)
+        }
         if $result.exit_code != 0 {
             print $"(ansi red)  ($CROSS) Failed to create worktree(ansi reset)"
             return
@@ -325,8 +431,11 @@ export def "wt add" [
     print $"(ansi cyan)   ($worktree_path)(ansi reset)"
     print $"(ansi cyan)   Branch: ($branch_name)(ansi reset)"
     print ""
-    print $"(ansi yellow)To navigate to your new worktree, run:(ansi reset)"
-    print $"   cd ($worktree_path)"
+
+    let response = (input "Do you want to navigate to the new worktree? (Y/n) ")
+    if not ($response =~ '^[Nn]$') {
+        cd $worktree_path
+    }
 }
 
 # List all worktrees, marking the current one with ★
@@ -385,12 +494,22 @@ export def "wt remove" [
     let ctx = (wt-context)
     if $ctx == null { return }
 
-    let worktree_path = ($ctx.worktree_parent | path join $name)
+    # Look up the worktree from git's worktree list by name (handles any location)
+    let worktrees = (parse-worktrees $ctx.project_dir)
+    let matched = (
+        $worktrees
+        | where { |wt| $wt.name == $name and (not $wt.is_bare) }
+    )
 
-    if not ($worktree_path | path exists) {
-        print $"(ansi red)($CROSS) Error: Worktree '($name)' not found at ($worktree_path)(ansi reset)"
+    if ($matched | is-empty) {
+        print $"(ansi red)($CROSS) Error: Worktree '($name)' not found(ansi reset)"
+        print $"(ansi yellow)   Run '($ctx.cmd) list' to see available worktrees(ansi reset)"
         return
     }
+
+    let matched_wt = ($matched | first)
+    let worktree_path = $matched_wt.path
+    let branch_name = $matched_wt.branch
 
     let def_branch = (default-branch $ctx.project_dir)
 
@@ -400,15 +519,6 @@ export def "wt remove" [
         print $"(ansi yellow)   The default branch worktree is the baseline for all other worktrees.(ansi reset)"
         return
     }
-
-    # Find the branch for this worktree
-    let worktrees = (parse-worktrees $ctx.project_dir)
-    let normalized_target = ($worktree_path | path expand | str downcase)
-    let matched = (
-        $worktrees
-        | where { |wt| ($wt.path | path expand | str downcase) == $normalized_target }
-    )
-    let branch_name = (if ($matched | is-empty) { null } else { $matched | first | get branch })
 
     # Protect by branch
     if $branch_name != null and $def_branch != null and $branch_name == $def_branch {
@@ -445,18 +555,16 @@ export def "wt remove-all" [] {
 
     let parsed = (parse-worktrees $ctx.project_dir)
     let def_branch = (default-branch $ctx.project_dir)
-    let normalized_parent = ($ctx.worktree_parent | path expand | str downcase)
 
     mut to_remove = []
     for wt in $parsed {
-        let norm_path = ($wt.path | path expand | str downcase)
-        if ($norm_path | str starts-with $normalized_parent) {
-            # Skip default branch worktree
-            if $def_branch != null and ($wt.branch == $def_branch or $wt.name == $def_branch) {
-                continue
-            }
-            $to_remove = ($to_remove | append $wt)
+        # Consider all non-bare worktrees, not just those under worktree_parent
+        if $wt.is_bare { continue }
+        # Skip default branch worktree
+        if $def_branch != null and ($wt.branch == $def_branch or $wt.name == $def_branch) {
+            continue
         }
+        $to_remove = ($to_remove | append $wt)
     }
 
     if ($to_remove | is-empty) {
@@ -550,6 +658,8 @@ export def "wt fix-fetch" [] {
 export def "wt clone" [
     url: string  # Repository URL (HTTPS or SSH)
 ] {
+    let cmd = (resolve-command-name)
+
     # Extract repo name from URL
     let repo_name = ($url | str replace --regex '\.git$' '' | str replace --regex '.*[/:]' '')
     let bare_name = $"($repo_name).git"
@@ -593,7 +703,7 @@ export def "wt clone" [
     if $main_branch == null {
         print $"(ansi red)  ($CROSS) Failed to detect default branch(ansi reset)"
         print $"(ansi yellow)   The repository was cloned but no worktree was created.(ansi reset)"
-        print $"(ansi yellow)   You can manually create a worktree using: wt add <name>(ansi reset)"
+        print $"(ansi yellow)   You can manually create a worktree using: ($cmd) add <name>(ansi reset)"
         return
     }
     print $"(ansi green)  ($CHECK) Found default branch: ($main_branch)(ansi reset)"
@@ -631,3 +741,14 @@ export def "wt clone" [
     print $"(ansi yellow)To start working, run:(ansi reset)"
     print $"   cd ($bare_name)/($WORKTREE_FOLDER)/($main_branch)"
 }
+
+# ---------------------------------------------------------------------------
+# Alias support: if command name is not "wt", create an alias
+# ---------------------------------------------------------------------------
+# NOTE: In nushell, dynamic aliasing at source-time is limited.
+# Users should add the following to their config if they use a custom name:
+#   alias mycmd = wt
+#   alias "mycmd add" = wt add
+#   ... etc.
+# The resolve-command-name function ensures all user-facing strings
+# (help, usage, error messages) use the configured name.
