@@ -178,15 +178,18 @@ function Get-GitRoot {
 
 # Show help
 function Show-WorktreeHelp {
+    $cmd = $script:WT_COMMAND_NAME
+    if (-not $cmd) { $cmd = "wt" }
     Write-Host "=== Git Worktree Manager ===" -ForegroundColor Blue
     Write-Host ""
     Write-Host "Usage: " -NoNewline -ForegroundColor Cyan
-    Write-Host "wt <command>" -ForegroundColor Yellow
+    Write-Host "${cmd} <command>" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Commands:" -ForegroundColor Cyan
     Write-Host "  " -NoNewline
-    Write-Host "add <name> [type]" -ForegroundColor Green -NoNewline
-    Write-Host "     Create a new worktree (type defaults to 'feature')"
+    Write-Host "add <name> [type] [--from <worktree>]" -ForegroundColor Green -NoNewline
+    Write-Host ""
+    Write-Host "                          Create a new worktree (type defaults to 'feature')"
     Write-Host "  " -NoNewline
     Write-Host "list" -ForegroundColor Green -NoNewline
     Write-Host "                List all worktrees"
@@ -208,31 +211,35 @@ function Show-WorktreeHelp {
     Write-Host "  • Branch name format: <type>/<name> (default type is 'feature')"
     Write-Host "  • If the branch doesn't exist, it creates a new branch"
     Write-Host "  • If the branch already exists, it checks out the existing branch"
+    Write-Host "  • Use --from to base the new branch on another worktree's branch"
     Write-Host ""
     Write-Host "Examples:" -ForegroundColor Cyan
     Write-Host "  " -NoNewline
-    Write-Host "wt add RDUCH-123-add-serialization" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} add RDUCH-123-add-serialization" -ForegroundColor Yellow -NoNewline
     Write-Host "     # Creates trees/RDUCH-123-add-serialization with branch feature/RDUCH-123-add-serialization"
     Write-Host "  " -NoNewline
-    Write-Host "wt add RTJK-1223332-whatever bug" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} add RTJK-1223332-whatever bug" -ForegroundColor Yellow -NoNewline
     Write-Host "    # Creates trees/RTJK-1223332-whatever with branch bug/RTJK-1223332-whatever"
     Write-Host "  " -NoNewline
-    Write-Host "wt add look-at-this wowdude" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} add look-at-this wowdude" -ForegroundColor Yellow -NoNewline
     Write-Host "          # Creates trees/look-at-this with branch wowdude/look-at-this"
     Write-Host "  " -NoNewline
-    Write-Host "wt list" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} add my-fix --from other-tree" -ForegroundColor Yellow -NoNewline
+    Write-Host "          # Creates trees/my-fix branching from other-tree's branch"
+    Write-Host "  " -NoNewline
+    Write-Host "${cmd} list" -ForegroundColor Yellow -NoNewline
     Write-Host "                              # List all worktrees (shows current with ★)"
     Write-Host "  " -NoNewline
-    Write-Host "wt remove my-feature" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} remove my-feature" -ForegroundColor Yellow -NoNewline
     Write-Host "                 # Remove specific worktree"
     Write-Host "  " -NoNewline
-    Write-Host "wt remove-all" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} remove-all" -ForegroundColor Yellow -NoNewline
     Write-Host "                        # Remove all worktrees"
     Write-Host "  " -NoNewline
-    Write-Host "wt fix-fetch" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} fix-fetch" -ForegroundColor Yellow -NoNewline
     Write-Host "                        # Fix fetch refspec configuration"
     Write-Host "  " -NoNewline
-    Write-Host "wt clone https://github.com/user/repo.git" -ForegroundColor Yellow -NoNewline
+    Write-Host "${cmd} clone https://github.com/user/repo.git" -ForegroundColor Yellow -NoNewline
     Write-Host "  # Clone repo as bare and set up main worktree"
     Write-Host ""
 }
@@ -341,14 +348,20 @@ function Remove-Worktree {
 
     if ([string]::IsNullOrWhiteSpace($Name)) {
         Write-Host "${script:CROSS} Error: Please specify which worktree to remove" -ForegroundColor Red
-        Write-Host "   Usage: wt remove <worktree-name>" -ForegroundColor Yellow
+        Write-Host "   Usage: $($script:WT_COMMAND_NAME) remove <worktree-name>" -ForegroundColor Yellow
         return
     }
 
-    $worktreePath = Join-Path $script:WORKTREE_PARENT $Name
+    # Look up the worktree from git's worktree list by name (handles any location)
+    $worktrees = Get-ParsedWorktrees
+    $matchedWorktree = $worktrees | Where-Object { $_.Name -eq $Name -and -not $_.IsBare } | Select-Object -First 1
 
-    if (-not (Test-Path $worktreePath)) {
-        Write-Host "${script:CROSS} Error: Worktree '${Name}' not found at ${worktreePath}" -ForegroundColor Red
+    if ($matchedWorktree) {
+        $worktreePath = $matchedWorktree.Path
+        $branchName = $matchedWorktree.Branch
+    } else {
+        Write-Host "${script:CROSS} Error: Worktree '${Name}' not found" -ForegroundColor Red
+        Write-Host "   Run '$($script:WT_COMMAND_NAME) list' to see available worktrees" -ForegroundColor Yellow
         return
     }
 
@@ -360,19 +373,6 @@ function Remove-Worktree {
         Write-Host "${script:CROSS} Error: Cannot remove the default branch worktree '${Name}'" -ForegroundColor Red
         Write-Host "   The default branch worktree is the baseline for all other worktrees." -ForegroundColor Yellow
         return
-    }
-
-    # Get the branch name associated with this worktree before removing it
-    $worktrees = Get-ParsedWorktrees
-    $normalizedWorktreePath = $worktreePath -replace '\\', '/'
-    $branchName = $null
-
-    foreach ($wt in $worktrees) {
-        $normalizedPath = $wt.Path -replace '\\', '/'
-        if ($normalizedPath -eq $normalizedWorktreePath) {
-            $branchName = $wt.Branch
-            break
-        }
     }
 
     # Additional check: protect if the branch is the default branch
@@ -414,19 +414,14 @@ function Remove-AllWorktrees {
     # Get the default branch so we don't delete it (it's the baseline for all worktrees)
     $defaultBranch = Get-DefaultBranch
 
-    # Normalize WORKTREE_PARENT for comparison (git uses forward slashes)
-    $normalizedParent = $script:WORKTREE_PARENT -replace '\\', '/'
-
-    # Collect worktrees in the trees folder, excluding the default branch
+    # Collect all non-bare worktrees, excluding the default branch
     foreach ($wt in $parsedWorktrees) {
-        $normalizedPath = $wt.Path -replace '\\', '/'
-        if ($normalizedPath.StartsWith($normalizedParent)) {
-            # Skip the default branch worktree - it must always be preserved
-            if ($wt.Branch -eq $defaultBranch -or $wt.Name -eq $defaultBranch) {
-                continue
-            }
-            $worktreesToRemove += $wt
+        if ($wt.IsBare) { continue }
+        # Skip the default branch worktree - it must always be preserved
+        if ($wt.Branch -eq $defaultBranch -or $wt.Name -eq $defaultBranch) {
+            continue
         }
+        $worktreesToRemove += $wt
     }
 
     if ($worktreesToRemove.Count -eq 0) {
@@ -481,11 +476,13 @@ function Initialize-MainWorktree {
     # Detect the default branch from remote
     $detectedBranch = Get-DefaultBranch
 
-    # Check if a worktree for the default branch already exists
+    # Check if a worktree for the default branch already exists (at any location)
+    $parsedWorktrees = Get-ParsedWorktrees
+
     if ($detectedBranch) {
-        $detectedPath = Join-Path $script:WORKTREE_PARENT $detectedBranch
-        if (Test-Path $detectedPath) {
-            $mainWorktreePath = $detectedPath
+        $matchedWorktree = $parsedWorktrees | Where-Object { $_.Branch -eq $detectedBranch -and -not $_.IsBare } | Select-Object -First 1
+        if ($matchedWorktree) {
+            $mainWorktreePath = $matchedWorktree.Path
             $mainBranch = $detectedBranch
         }
     }
@@ -494,9 +491,9 @@ function Initialize-MainWorktree {
     if (-not $mainWorktreePath) {
         $commonBranches = @("main", "master", "develop", "trunk")
         foreach ($branch in $commonBranches) {
-            $branchPath = Join-Path $script:WORKTREE_PARENT $branch
-            if (Test-Path $branchPath) {
-                $mainWorktreePath = $branchPath
+            $matchedWorktree = $parsedWorktrees | Where-Object { $_.Branch -eq $branch -and -not $_.IsBare } | Select-Object -First 1
+            if ($matchedWorktree) {
+                $mainWorktreePath = $matchedWorktree.Path
                 $mainBranch = $branch
                 break
             }
@@ -506,6 +503,22 @@ function Initialize-MainWorktree {
     # No existing worktree found - need to create one
     if (-not $mainWorktreePath) {
         Write-Host "Default branch worktree doesn't exist. Creating it..." -ForegroundColor Yellow
+
+        # If default branch wasn't detected, fix refspec and retry (handles bare repos cloned without wt)
+        if (-not $detectedBranch) {
+            Set-FetchRefspec -Silent | Out-Null
+
+            Write-ProgressStart "Fetching all branches from bare repository"
+            git -C $script:PROJECT_DIR fetch --all 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-ProgressComplete "Fetched all branches" -Status "success"
+            } else {
+                Write-ProgressComplete "Failed to fetch branches" -Status "warning"
+            }
+
+            $detectedBranch = Get-DefaultBranch
+        }
+
         Write-ProgressStart "Detecting default branch"
 
         # Create parent directory if it doesn't exist
@@ -566,7 +579,7 @@ function New-BareRepository {
     # Validate URL argument
     if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
         Write-Host "${script:CROSS} Error: Please specify a repository URL" -ForegroundColor Red
-        Write-Host "   Usage: wt clone <url>" -ForegroundColor Yellow
+        Write-Host "   Usage: $($script:WT_COMMAND_NAME) clone <url>" -ForegroundColor Yellow
         return
     }
 
@@ -574,7 +587,7 @@ function New-BareRepository {
 
     if ([string]::IsNullOrWhiteSpace($repoUrl)) {
         Write-Host "${script:CROSS} Error: Please specify a repository URL" -ForegroundColor Red
-        Write-Host "   Usage: wt clone <url>" -ForegroundColor Yellow
+        Write-Host "   Usage: $($script:WT_COMMAND_NAME) clone <url>" -ForegroundColor Yellow
         return
     }
 
@@ -629,7 +642,7 @@ function New-BareRepository {
     if (-not $mainBranch) {
         Write-ProgressComplete "Failed to detect default branch" -Status "error"
         Write-Host "   The repository was cloned but no worktree was created." -ForegroundColor Yellow
-        Write-Host "   You can manually create a worktree using: wt add <name>" -ForegroundColor Yellow
+        Write-Host "   You can manually create a worktree using: $($script:WT_COMMAND_NAME) add <name>" -ForegroundColor Yellow
         return
     }
     Write-ProgressComplete "Found default branch: ${mainBranch}" -Status "success"
@@ -738,27 +751,75 @@ function New-Worktree {
 
     if ($Arguments.Count -eq 0) {
         Write-Host "${script:CROSS} Error: Please specify a name for the worktree" -ForegroundColor Red
-        Write-Host "   Usage: wt add <name> [type]" -ForegroundColor Yellow
+        Write-Host "   Usage: $($script:WT_COMMAND_NAME) add <name> [type] [--from <worktree>]" -ForegroundColor Yellow
         return
     }
 
-    # Ensure main worktree exists and is updated
-    Write-Host ""
-    Write-Host "=== Ensuring main worktree is up to date ===" -ForegroundColor Cyan
-    if (-not (Initialize-MainWorktree)) {
-        Write-Host "${script:CROSS} Failed to ensure main worktree. Aborting." -ForegroundColor Red
-        return
+    # Parse --from flag from arguments
+    $fromWorktree = $null
+    $positionalArgs = @()
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        if ($Arguments[$i] -eq "--from" -and ($i + 1) -lt $Arguments.Count) {
+            $fromWorktree = $Arguments[$i + 1]
+            $i++  # skip the value
+        } else {
+            $positionalArgs += $Arguments[$i]
+        }
     }
-    Write-Host ""
 
-    # Parse arguments: first is name, second (optional) is type
-    $worktreeName = $Arguments[0]
-    $branchType = $Arguments.Count -gt 1 ? $Arguments[1] : $script:DEFAULT_BRANCH_TYPE
+    # Parse positional arguments: first is name, second (optional) is type
+    $worktreeName = $positionalArgs[0]
+    $branchType = $positionalArgs.Count -gt 1 ? $positionalArgs[1] : $script:DEFAULT_BRANCH_TYPE
 
     if ([string]::IsNullOrWhiteSpace($worktreeName)) {
         Write-Host "${script:CROSS} Error: Please specify a name for the worktree" -ForegroundColor Red
-        Write-Host "   Usage: wt add <name> [type]" -ForegroundColor Yellow
+        Write-Host "   Usage: $($script:WT_COMMAND_NAME) add <name> [type] [--from <worktree>]" -ForegroundColor Yellow
         return
+    }
+
+    # Resolve --from source branch
+    $startPoint = $null
+    if ($fromWorktree) {
+        # When branching from another worktree, update that worktree instead of the default branch
+        Write-Host ""
+        Write-Host "=== Ensuring source worktree '${fromWorktree}' is up to date ===" -ForegroundColor Cyan
+
+        $parsedWorktrees = Get-ParsedWorktrees
+        $sourceWorktree = $parsedWorktrees | Where-Object { $_.Name -eq $fromWorktree -and -not $_.IsBare } | Select-Object -First 1
+        if (-not $sourceWorktree) {
+            Write-Host "${script:CROSS} Error: Source worktree '${fromWorktree}' not found" -ForegroundColor Red
+            Write-Host "   Run '$($script:WT_COMMAND_NAME) list' to see available worktrees" -ForegroundColor Yellow
+            return
+        }
+        $startPoint = $sourceWorktree.Branch
+
+        # Fetch all from bare repo
+        Write-ProgressStart "Fetching all branches from bare repository"
+        git -C $script:PROJECT_DIR fetch --all 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-ProgressComplete "Fetched all branches" -Status "success"
+        } else {
+            Write-ProgressComplete "Failed to fetch all branches (continuing anyway)" -Status "warning"
+        }
+
+        # Pull the source worktree
+        Write-ProgressStart "Updating source worktree '${fromWorktree}'"
+        git -C $sourceWorktree.Path pull 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-ProgressComplete "Source worktree '${fromWorktree}' updated" -Status "success"
+        } else {
+            Write-ProgressComplete "Failed to pull source worktree (continuing anyway)" -Status "warning"
+        }
+        Write-Host ""
+    } else {
+        # Ensure main worktree exists and is updated
+        Write-Host ""
+        Write-Host "=== Ensuring main worktree is up to date ===" -ForegroundColor Cyan
+        if (-not (Initialize-MainWorktree)) {
+            Write-Host "${script:CROSS} Failed to ensure main worktree. Aborting." -ForegroundColor Red
+            return
+        }
+        Write-Host ""
     }
 
     # Branch name format: {type}/{name}
@@ -776,6 +837,9 @@ function New-Worktree {
     Write-Host "=== Creating worktree '${worktreeName}' ===" -ForegroundColor Green
     Write-Host "   Branch: ${branchName}" -ForegroundColor Cyan
     Write-Host "   Path: ${worktreePath}" -ForegroundColor Cyan
+    if ($startPoint) {
+        Write-Host "   From: ${fromWorktree} (branch: ${startPoint})" -ForegroundColor Cyan
+    }
     Write-Host ""
 
     # Create parent directory
@@ -783,6 +847,9 @@ function New-Worktree {
 
     # Check if branch exists
     if (Test-BranchExists -BranchName $branchName) {
+        if ($startPoint) {
+            Write-Host "${script:WARNING} Branch '${branchName}' already exists, --from flag will be ignored" -ForegroundColor Yellow
+        }
         Write-Host "${script:SEARCH} Branch '${branchName}' already exists. Creating worktree from existing branch..." -ForegroundColor Blue
         Write-ProgressStart "Creating worktree"
         git -C $script:PROJECT_DIR worktree add $worktreePath $branchName 2>$null | Out-Null
@@ -794,7 +861,11 @@ function New-Worktree {
         }
     } else {
         Write-ProgressStart "Creating worktree"
-        git -C $script:PROJECT_DIR worktree add -b $branchName $worktreePath 2>$null | Out-Null
+        if ($startPoint) {
+            git -C $script:PROJECT_DIR worktree add -b $branchName $worktreePath $startPoint 2>$null | Out-Null
+        } else {
+            git -C $script:PROJECT_DIR worktree add -b $branchName $worktreePath 2>$null | Out-Null
+        }
         if ($LASTEXITCODE -eq 0) {
             Write-ProgressComplete "Worktree created" -Status "success"
         } else {
@@ -818,8 +889,11 @@ function New-Worktree {
     Write-Host "   $worktreePath" -ForegroundColor Cyan
     Write-Host "   Branch: $branchName" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "To navigate to your new worktree, run:" -ForegroundColor Yellow
-    Write-Host "   cd $worktreePath"
+
+    $response = Read-Host "Do you want to navigate to the new worktree? (Y/n)"
+    if ($response -notmatch '^[Nn]$') {
+        Set-Location $worktreePath
+    }
 }
 
 # Main function
@@ -881,8 +955,30 @@ function wt {
         }
         default {
             Write-Host "${script:CROSS} Error: Unknown command '${command}'" -ForegroundColor Red
-            Write-Host "   Run 'wt --help' to see available commands" -ForegroundColor Yellow
+            Write-Host "   Run '$($script:WT_COMMAND_NAME) --help' to see available commands" -ForegroundColor Yellow
             return
         }
     }
+}
+
+# Resolve command name: env var > ini file > default 'wt'
+$script:WT_COMMAND_NAME = $env:WT_RENAME
+if (-not $script:WT_COMMAND_NAME) {
+    $wtConfigPath = Join-Path $HOME ".wtconfig"
+    if (Test-Path $wtConfigPath) {
+        foreach ($line in (Get-Content $wtConfigPath)) {
+            if ($line -match '^\s*command_name\s*=\s*(.+)\s*$') {
+                $script:WT_COMMAND_NAME = $Matches[1].Trim()
+                break
+            }
+        }
+    }
+}
+if (-not $script:WT_COMMAND_NAME) {
+    $script:WT_COMMAND_NAME = "wt"
+}
+
+# Rename function if configured
+if ($script:WT_COMMAND_NAME -ne "wt") {
+    Rename-Item -Path "function:wt" -NewName $script:WT_COMMAND_NAME
 }
