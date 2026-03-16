@@ -611,7 +611,7 @@ function Initialize-MainWorktree {
         git -C $script:PROJECT_DIR worktree add $mainWorktreePath $mainBranch 2>$null | Out-Null
 
         if ($LASTEXITCODE -eq 0) {
-            Write-ProgressComplete "Worktree created at $script:WORKTREE_FOLDER/${mainBranch}" -Status "success"
+            Write-ProgressComplete "Worktree created at ${mainWorktreePath}" -Status "success"
             $worktreeCreated = $true
         } else {
             Write-ProgressComplete "Failed to create ${mainBranch} worktree" -Status "error"
@@ -733,7 +733,7 @@ function New-BareRepository {
         Write-ProgressComplete "Failed to create worktree for ${mainBranch}" -Status "error"
         return
     }
-    Write-ProgressComplete "Worktree created at $script:WORKTREE_FOLDER/${mainBranch}" -Status "success"
+    Write-ProgressComplete "Worktree created at ${mainWorktreePath}" -Status "success"
 
     # Set upstream tracking branch
     Set-BranchUpstream -WorktreePath $mainWorktreePath -BranchName $mainBranch | Out-Null
