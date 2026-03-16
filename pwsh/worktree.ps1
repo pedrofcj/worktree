@@ -12,7 +12,6 @@ $script:SEARCH = "🔍"
 
 # Configuration
 $script:DEFAULT_BRANCH_TYPE = "feature"
-$script:WORKTREE_FOLDER = "trees"
 
 # Read worktree folder configuration from env var or ~/.wtconfig
 # Returns $null if not configured (caller applies layout-dependent default)
@@ -254,9 +253,11 @@ function Show-WorktreeHelp {
     Write-Host "  " -NoNewline
     Write-Host "clone <url>" -ForegroundColor Green -NoNewline
     Write-Host "         Clone a repo as bare and set up worktree structure"
+    Write-Host "  " -NoNewline
+    Write-Host "migrate" -ForegroundColor Green -NoNewline
+    Write-Host "             Migrate a classic (trees/) layout to modern (.git) layout"
     Write-Host ""
     Write-Host "When creating a worktree:" -ForegroundColor Cyan
-    Write-Host "  • Worktree is created at trees/<name>"
     Write-Host "  • Branch name format: <type>/<name> (default type is 'feature')"
     Write-Host "  • If the branch doesn't exist, it creates a new branch"
     Write-Host "  • If the branch already exists, it checks out the existing branch"
@@ -264,20 +265,20 @@ function Show-WorktreeHelp {
     Write-Host ""
     Write-Host "Examples:" -ForegroundColor Cyan
     Write-Host "  " -NoNewline
+    Write-Host "${cmd} clone https://github.com/user/repo.git" -ForegroundColor Yellow -NoNewline
+    Write-Host "  # Clone repo as bare and set up main worktree"
+    Write-Host "  " -NoNewline
     Write-Host "${cmd} add RDUCH-123-add-serialization" -ForegroundColor Yellow -NoNewline
-    Write-Host "     # Creates trees/RDUCH-123-add-serialization with branch feature/RDUCH-123-add-serialization"
+    Write-Host "     # Creates worktree with branch feature/RDUCH-123-add-serialization"
     Write-Host "  " -NoNewline
     Write-Host "${cmd} add RTJK-1223332-whatever bug" -ForegroundColor Yellow -NoNewline
-    Write-Host "    # Creates trees/RTJK-1223332-whatever with branch bug/RTJK-1223332-whatever"
-    Write-Host "  " -NoNewline
-    Write-Host "${cmd} add look-at-this wowdude" -ForegroundColor Yellow -NoNewline
-    Write-Host "          # Creates trees/look-at-this with branch wowdude/look-at-this"
+    Write-Host "    # Creates worktree with branch bug/RTJK-1223332-whatever"
     Write-Host "  " -NoNewline
     Write-Host "${cmd} add my-fix --from other-tree" -ForegroundColor Yellow -NoNewline
-    Write-Host "          # Creates trees/my-fix branching from other-tree's branch"
+    Write-Host "          # Creates worktree branching from other-tree's branch"
     Write-Host "  " -NoNewline
     Write-Host "${cmd} list" -ForegroundColor Yellow -NoNewline
-    Write-Host "                              # List all worktrees (shows current with ★)"
+    Write-Host "                              # List all worktrees (shows current with ${script:STAR})"
     Write-Host "  " -NoNewline
     Write-Host "${cmd} remove my-feature" -ForegroundColor Yellow -NoNewline
     Write-Host "                 # Remove specific worktree"
@@ -288,8 +289,14 @@ function Show-WorktreeHelp {
     Write-Host "${cmd} fix-fetch" -ForegroundColor Yellow -NoNewline
     Write-Host "                        # Fix fetch refspec configuration"
     Write-Host "  " -NoNewline
-    Write-Host "${cmd} clone https://github.com/user/repo.git" -ForegroundColor Yellow -NoNewline
-    Write-Host "  # Clone repo as bare and set up main worktree"
+    Write-Host "${cmd} migrate" -ForegroundColor Yellow -NoNewline
+    Write-Host "                         # Migrate classic layout to modern layout"
+    Write-Host ""
+    Write-Host "Configuration (~/.wtconfig or environment variables):" -ForegroundColor Cyan
+    Write-Host "  command_name / WT_RENAME              " -NoNewline -ForegroundColor Green
+    Write-Host "Set custom command name"
+    Write-Host "  worktree_folder / WT_WORKTREE_FOLDER  " -NoNewline -ForegroundColor Green
+    Write-Host "Set worktree subfolder (default: project root)"
     Write-Host ""
 }
 
