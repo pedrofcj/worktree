@@ -13,7 +13,7 @@ All notable changes to the Git Worktree Manager will be documented in this file.
 - **`wt clone` offers to `cd`**: After cloning, prompts to navigate into the default branch worktree (like `wt add` already does).
 
 ### Changed
-- **PowerShell only** for now — bash/zsh/nushell will follow in a separate update.
+- All four implementations (PowerShell, Bash, Zsh, Nushell) updated with modern layout support.
 - Help text updated with `migrate` command, modern layout examples, and configuration reference.
 
 ## 2026-03-15

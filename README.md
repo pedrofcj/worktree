@@ -72,8 +72,6 @@ MyProject/
 
 Existing repos using the **classic layout** (`MyProject.git/trees/`) continue to work. You can convert them with `wt migrate`.
 
-> **Note:** The modern layout is currently PowerShell-only. Bash, Zsh, and Nushell still use the classic layout and will be updated in a future release.
-
 ## Configuration
 
 All configuration is optional. Settings can be placed in `~/.wtconfig` or set via environment variables. Priority: environment variable > config file > default.
