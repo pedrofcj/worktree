@@ -645,7 +645,7 @@ function Initialize-MainWorktree {
     return $true
 }
 
-# Clone repository as bare
+# Clone repository as bare with modern layout
 function New-BareRepository {
     param([string[]]$Arguments)
 
@@ -669,38 +669,49 @@ function New-BareRepository {
     # Handle SSH: git@github.com:user/repo.git -> repo
     $repoName = $repoUrl -replace '\.git$', ''  # Remove .git suffix if present
     $repoName = $repoName -replace '.*[/:]', '' # Get last part after / or :
-    $bareRepoName = "${repoName}.git"
 
-    $destinationPath = Join-Path $PWD.Path $bareRepoName
+    $destinationPath = Join-Path $PWD.Path $repoName
+    $bareRepoPath = Join-Path $destinationPath ".git"
 
     if (Test-Path $destinationPath) {
-        Write-Host "${script:CROSS} Error: Directory '${bareRepoName}' already exists" -ForegroundColor Red
+        Write-Host "${script:CROSS} Error: Directory '${repoName}' already exists" -ForegroundColor Red
         Write-Host "   Please remove it or choose a different location" -ForegroundColor Yellow
         return
     }
 
     Write-Host "=== Cloning repository as bare ===" -ForegroundColor Blue
     Write-Host "   URL: ${repoUrl}" -ForegroundColor Cyan
-    Write-Host "   Destination: ./${bareRepoName}" -ForegroundColor Cyan
+    Write-Host "   Destination: ./${repoName}" -ForegroundColor Cyan
     Write-Host ""
 
-    # Clone with --bare flag
+    # Create project root directory
+    New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+
+    # Clone with --bare flag into .git subdirectory
     Write-ProgressStart "Cloning repository"
-    $cloneResult = git clone --bare $repoUrl $destinationPath 2>&1
+    $cloneResult = git clone --bare $repoUrl $bareRepoPath 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         Write-ProgressComplete "Failed to clone repository" -Status "error"
         Write-Host "   Error: $cloneResult" -ForegroundColor Yellow
+        # Clean up the empty directory
+        Remove-Item -Path $destinationPath -Force -Recurse -ErrorAction SilentlyContinue
         return
     }
     Write-ProgressComplete "Repository cloned" -Status "success"
 
+    # Ensure core.bare is explicitly set (safety for .git directory name)
+    git -C $bareRepoPath config core.bare true 2>$null | Out-Null
+
+    # Set layout marker
+    git -C $bareRepoPath config wt.layout modern 2>$null | Out-Null
+
     # Configure fetch refspec
-    Set-FetchRefspec -RepoPath $destinationPath | Out-Null
+    Set-FetchRefspec -RepoPath $bareRepoPath | Out-Null
 
     # Fetch all branches
     Write-ProgressStart "Fetching all branches"
-    git -C $destinationPath fetch --all 2>$null | Out-Null
+    git -C $bareRepoPath fetch --all 2>$null | Out-Null
 
     if ($LASTEXITCODE -eq 0) {
         Write-ProgressComplete "Fetched all branches" -Status "success"
@@ -710,7 +721,7 @@ function New-BareRepository {
 
     # Detect default branch dynamically
     Write-ProgressStart "Detecting default branch"
-    $mainBranch = Get-DefaultBranch -RepoPath $destinationPath
+    $mainBranch = Get-DefaultBranch -RepoPath $bareRepoPath
 
     if (-not $mainBranch) {
         Write-ProgressComplete "Failed to detect default branch" -Status "error"
@@ -720,14 +731,24 @@ function New-BareRepository {
     }
     Write-ProgressComplete "Found default branch: ${mainBranch}" -Status "success"
 
-    # Create trees folder
-    $treesPath = Join-Path $destinationPath $script:WORKTREE_FOLDER
-    New-Item -ItemType Directory -Path $treesPath -Force | Out-Null
+    # Resolve worktree folder from config (no layout context needed — modern default is "")
+    $worktreeFolder = Get-WorktreeFolder
+    if ($null -eq $worktreeFolder) {
+        $worktreeFolder = ""
+    }
+
+    # Compute worktree parent
+    if ($worktreeFolder) {
+        $worktreeParent = Join-Path $destinationPath $worktreeFolder
+        New-Item -ItemType Directory -Path $worktreeParent -Force | Out-Null
+    } else {
+        $worktreeParent = $destinationPath
+    }
 
     # Create worktree for default branch
-    $mainWorktreePath = Join-Path $treesPath $mainBranch
+    $mainWorktreePath = Join-Path $worktreeParent $mainBranch
     Write-ProgressStart "Creating worktree for ${mainBranch} branch"
-    git -C $destinationPath worktree add $mainWorktreePath $mainBranch 2>$null | Out-Null
+    git -C $bareRepoPath worktree add $mainWorktreePath $mainBranch 2>$null | Out-Null
 
     if ($LASTEXITCODE -ne 0) {
         Write-ProgressComplete "Failed to create worktree for ${mainBranch}" -Status "error"
@@ -750,11 +771,17 @@ function New-BareRepository {
 
     Write-Host ""
     Write-Host "${script:CHECK} Repository setup complete!" -ForegroundColor Green
-    Write-Host "   Bare repo: ${destinationPath}" -ForegroundColor Cyan
+    Write-Host "   Project root: ${destinationPath}" -ForegroundColor Cyan
+    Write-Host "   Bare repo: ${bareRepoPath}" -ForegroundColor Cyan
     Write-Host "   Main worktree: ${mainWorktreePath}" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "To start working, run:" -ForegroundColor Yellow
-    Write-Host "   cd ${bareRepoName}\$script:WORKTREE_FOLDER\${mainBranch}"
+    Write-Host "${script:INFO} The project root (${repoName}/) is a container — work inside worktree directories." -ForegroundColor Yellow
+    Write-Host ""
+
+    $response = Read-Host "Do you want to navigate to the main worktree? (Y/n)"
+    if ($response -notmatch '^[Nn]$') {
+        Set-Location $mainWorktreePath
+    }
 }
 
 # Fix fetch refspec configuration
