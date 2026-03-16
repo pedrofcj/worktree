@@ -12,11 +12,81 @@ const SEARCH = "🔍"
 
 # Configuration
 const DEFAULT_BRANCH_TYPE = "feature"
-const WORKTREE_FOLDER = "trees"
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+# Read worktree folder configuration from env var or ~/.wtconfig
+# Returns the configured value, or null if not configured
+def get-worktree-folder [] {
+    # Priority 1: environment variable
+    if "WT_WORKTREE_FOLDER" in $env {
+        return $env.WT_WORKTREE_FOLDER
+    }
+
+    # Priority 2: ~/.wtconfig file
+    let config_path = ($nu.home-path | path join ".wtconfig")
+    if ($config_path | path exists) {
+        let lines = (open $config_path | lines)
+        for line in $lines {
+            let m = ($line | parse --regex '^\s*worktree_folder\s*=\s*(?P<val>.+)\s*$')
+            if not ($m | is-empty) {
+                let val = ($m | first | get val | str trim)
+                return $val
+            }
+        }
+    }
+
+    return null
+}
+
+# Detect repository layout (modern vs classic) and return project root.
+# Returns a record { layout_type: string, project_root: string }.
+def get-project-layout [project_dir: string] {
+    # Primary detection: check for wt.layout git config
+    let layout_config = (^git -C $project_dir config --get wt.layout | complete)
+    if $layout_config.exit_code == 0 {
+        let val = ($layout_config.stdout | str trim)
+        if $val != "" {
+            let root = if $val == "modern" {
+                ($project_dir | path dirname)
+            } else {
+                $project_dir
+            }
+            return { layout_type: $val, project_root: $root }
+        }
+    }
+
+    # Fallback heuristic: check if bare repo dir name is exactly ".git"
+    let leaf = ($project_dir | path basename)
+    if $leaf == ".git" {
+        return { layout_type: "modern", project_root: ($project_dir | path dirname) }
+    } else {
+        return { layout_type: "classic", project_root: $project_dir }
+    }
+}
+
+# Validate worktree name against reserved names and path rules
+def validate-worktree-name [name: string, worktree_folder: string] {
+    let reserved = [".git" ".bare" ".."]
+    if $name in $reserved {
+        print $"(ansi red)($CROSS) Error: '($name)' is a reserved name and cannot be used as a worktree name(ansi reset)"
+        return false
+    }
+
+    if ($name | str contains "/") or ($name | str contains "\\") {
+        print $"(ansi red)($CROSS) Error: Worktree name '($name)' cannot contain path separators(ansi reset)"
+        return false
+    }
+
+    if $worktree_folder != "" and $name == $worktree_folder {
+        print $"(ansi red)($CROSS) Error: '($name)' conflicts with the configured worktree folder name(ansi reset)"
+        return false
+    }
+
+    true
+}
 
 # Detect the bare-repo root (works from bare dir or any of its worktrees).
 # Returns the absolute path or null.
@@ -74,15 +144,41 @@ def resolve-command-name [] {
     "wt"
 }
 
-# Build a context record { project_dir, project_name, worktree_parent, cmd }.
+# Build a context record with layout-aware fields.
 # Returns null when not in a bare repo.
 def wt-context [] {
     let root = (get-git-root)
     if $root == null { return null }
-    let name = ($root | path basename)
-    let parent = ($root | path join $WORKTREE_FOLDER)
+
+    let layout = (get-project-layout $root)
+    let name = ($layout.project_root | path basename)
     let cmd = (resolve-command-name)
-    { project_dir: $root, project_name: $name, worktree_parent: $parent, cmd: $cmd }
+
+    # Resolve worktree folder
+    let configured = (get-worktree-folder)
+    let wt_folder = if $configured != null {
+        $configured
+    } else if $layout.layout_type == "classic" {
+        "trees"
+    } else {
+        ""
+    }
+
+    let parent = if $wt_folder != "" {
+        ($layout.project_root | path join $wt_folder)
+    } else {
+        $layout.project_root
+    }
+
+    {
+        project_dir: $root,
+        project_root: $layout.project_root,
+        project_name: $name,
+        worktree_parent: $parent,
+        worktree_folder: $wt_folder,
+        layout_type: $layout.layout_type,
+        cmd: $cmd
+    }
 }
 
 # Parse `git worktree list` into structured records.
@@ -241,7 +337,7 @@ def ensure-main-worktree [project_dir: string, worktree_parent: string] {
         print $"  Creating ($main_branch) worktree..."
         let wt_result = (^git -C $project_dir worktree add $main_path $main_branch | complete)
         if $wt_result.exit_code == 0 {
-            print $"(ansi green)  ($CHECK) Worktree created at ($WORKTREE_FOLDER)/($main_branch)(ansi reset)"
+            print $"(ansi green)  ($CHECK) Worktree created at ($main_path)(ansi reset)"
             $created = true
         } else {
             print $"(ansi red)  ($CROSS) Failed to create ($main_branch) worktree(ansi reset)"
@@ -294,24 +390,29 @@ export def wt [] {
     print $"  (ansi green)remove-all(ansi reset)          Remove all worktrees \(with confirmation\)"
     print $"  (ansi green)fix-fetch(ansi reset)           Fix fetch refspec configuration for bare repos"
     print $"  (ansi green)clone <url>(ansi reset)         Clone a repo as bare and set up worktree structure"
+    print $"  (ansi green)migrate(ansi reset)             Migrate a classic \(trees/\) layout to modern \(.git\) layout"
     print ""
     print $"(ansi cyan)When creating a worktree:(ansi reset)"
-    print "  • Worktree is created at trees/<name>"
     print "  • Branch name format: <type>/<name> (default type is 'feature')"
     print "  • If the branch doesn't exist, it creates a new branch"
     print "  • If the branch already exists, it checks out the existing branch"
     print "  • Use --from to base the new branch on another worktree's branch"
     print ""
     print $"(ansi cyan)Examples:(ansi reset)"
-    print $"  (ansi yellow)($cmd) add RDUCH-123-add-serialization(ansi reset)     # branch feature/RDUCH-123-add-serialization"
-    print $"  (ansi yellow)($cmd) add RTJK-1223332-whatever bug(ansi reset)    # branch bug/RTJK-1223332-whatever"
+    print $"  (ansi yellow)($cmd) clone https://github.com/user/repo.git(ansi reset)  # Clone repo as bare and set up main worktree"
+    print $"  (ansi yellow)($cmd) add RDUCH-123-add-serialization(ansi reset)     # Creates worktree with branch feature/RDUCH-123-add-serialization"
+    print $"  (ansi yellow)($cmd) add RTJK-1223332-whatever bug(ansi reset)    # Creates worktree with branch bug/RTJK-1223332-whatever"
     print $"  (ansi yellow)($cmd) add look-at-this wowdude(ansi reset)          # branch wowdude/look-at-this"
-    print $"  (ansi yellow)($cmd) add my-fix --from other-tree(ansi reset)          # Creates trees/my-fix branching from other-tree's branch"
-    print $"  (ansi yellow)($cmd) list(ansi reset)                              # List all worktrees \(★ = current\)"
+    print $"  (ansi yellow)($cmd) add my-fix --from other-tree(ansi reset)          # Creates worktree branching from other-tree's branch"
+    print $"  (ansi yellow)($cmd) list(ansi reset)                              # List all worktrees \(($STAR) = current\)"
     print $"  (ansi yellow)($cmd) remove my-feature(ansi reset)                 # Remove specific worktree"
     print $"  (ansi yellow)($cmd) remove-all(ansi reset)                        # Remove all worktrees"
     print $"  (ansi yellow)($cmd) fix-fetch(ansi reset)                        # Fix fetch refspec configuration"
-    print $"  (ansi yellow)($cmd) clone https://github.com/user/repo.git(ansi reset)  # Clone as bare + main worktree"
+    print $"  (ansi yellow)($cmd) migrate(ansi reset)                         # Migrate classic layout to modern layout"
+    print ""
+    print $"(ansi cyan)Configuration \(~/.wtconfig or environment variables\):(ansi reset)"
+    print $"  (ansi green)command_name / WT_RENAME(ansi reset)              Set custom command name"
+    print $"  (ansi green)worktree_folder / WT_WORKTREE_FOLDER(ansi reset)  Set worktree subfolder \(default: project root\)"
     print ""
 }
 
@@ -323,6 +424,11 @@ export def "wt add" [
 ] {
     let ctx = (wt-context)
     if $ctx == null { return }
+
+    # Validate worktree name
+    if not (validate-worktree-name $name $ctx.worktree_folder) {
+        return
+    }
 
     mut start_point: string = ""
 
@@ -654,7 +760,7 @@ export def "wt fix-fetch" [] {
     }
 }
 
-# Clone a repository as bare and set up worktree structure
+# Clone a repository as bare and set up modern worktree structure
 export def "wt clone" [
     url: string  # Repository URL (HTTPS or SSH)
 ] {
@@ -662,35 +768,47 @@ export def "wt clone" [
 
     # Extract repo name from URL
     let repo_name = ($url | str replace --regex '\.git$' '' | str replace --regex '.*[/:]' '')
-    let bare_name = $"($repo_name).git"
-    let dest = ($env.PWD | path join $bare_name)
+    let destination_path = ($env.PWD | path join $repo_name)
+    let bare_repo_path = ($destination_path | path join ".git")
 
-    if ($dest | path exists) {
-        print $"(ansi red)($CROSS) Error: Directory '($bare_name)' already exists(ansi reset)"
+    if ($destination_path | path exists) {
+        print $"(ansi red)($CROSS) Error: Directory '($repo_name)' already exists(ansi reset)"
         print $"(ansi yellow)   Please remove it or choose a different location(ansi reset)"
         return
     }
 
     print $"(ansi blue)=== Cloning repository as bare ===(ansi reset)"
     print $"(ansi cyan)   URL: ($url)(ansi reset)"
-    print $"(ansi cyan)   Destination: ./($bare_name)(ansi reset)"
+    print $"(ansi cyan)   Destination: ./($repo_name)(ansi reset)"
     print ""
 
+    # Create project root directory
+    mkdir $destination_path
+
+    # Clone with --bare flag into .git subdirectory
     print "  Cloning repository..."
-    let clone = (^git clone --bare $url $dest | complete)
+    let clone = (^git clone --bare $url $bare_repo_path | complete)
     if $clone.exit_code != 0 {
         print $"(ansi red)  ($CROSS) Failed to clone repository(ansi reset)"
         print $"(ansi yellow)   Error: ($clone.stderr | str trim)(ansi reset)"
+        # Clean up the empty directory
+        rm -rf $destination_path
         return
     }
     print $"(ansi green)  ($CHECK) Repository cloned(ansi reset)"
 
+    # Ensure core.bare is explicitly set (safety for .git directory name)
+    ^git -C $bare_repo_path config core.bare true | complete | ignore
+
+    # Set layout marker
+    ^git -C $bare_repo_path config wt.layout modern | complete | ignore
+
     # Configure fetch refspec
-    set-fetch-refspec $dest | ignore
+    set-fetch-refspec $bare_repo_path | ignore
 
     # Fetch all branches
     print "  Fetching all branches..."
-    let fetch = (^git -C $dest fetch --all | complete)
+    let fetch = (^git -C $bare_repo_path fetch --all | complete)
     if $fetch.exit_code == 0 {
         print $"(ansi green)  ($CHECK) Fetched all branches(ansi reset)"
     } else {
@@ -699,7 +817,7 @@ export def "wt clone" [
 
     # Detect default branch
     print "  Detecting default branch..."
-    let main_branch = (default-branch $dest)
+    let main_branch = (default-branch $bare_repo_path)
     if $main_branch == null {
         print $"(ansi red)  ($CROSS) Failed to detect default branch(ansi reset)"
         print $"(ansi yellow)   The repository was cloned but no worktree was created.(ansi reset)"
@@ -708,18 +826,32 @@ export def "wt clone" [
     }
     print $"(ansi green)  ($CHECK) Found default branch: ($main_branch)(ansi reset)"
 
-    # Create trees folder and main worktree
-    let trees_path = ($dest | path join $WORKTREE_FOLDER)
-    mkdir $trees_path
+    # Resolve worktree folder from config (no layout context needed — modern default is "")
+    let configured = (get-worktree-folder)
+    let wt_folder = if $configured != null {
+        $configured
+    } else {
+        ""
+    }
 
-    let main_path = ($trees_path | path join $main_branch)
+    # Compute worktree parent
+    let worktree_parent = if $wt_folder != "" {
+        let p = ($destination_path | path join $wt_folder)
+        mkdir $p
+        $p
+    } else {
+        $destination_path
+    }
+
+    # Create worktree for default branch
+    let main_path = ($worktree_parent | path join $main_branch)
     print $"  Creating worktree for ($main_branch) branch..."
-    let wt_result = (^git -C $dest worktree add $main_path $main_branch | complete)
+    let wt_result = (^git -C $bare_repo_path worktree add $main_path $main_branch | complete)
     if $wt_result.exit_code != 0 {
         print $"(ansi red)  ($CROSS) Failed to create worktree for ($main_branch)(ansi reset)"
         return
     }
-    print $"(ansi green)  ($CHECK) Worktree created at ($WORKTREE_FOLDER)/($main_branch)(ansi reset)"
+    print $"(ansi green)  ($CHECK) Worktree created at ($main_path)(ansi reset)"
 
     # Set upstream tracking
     set-upstream $main_path $main_branch | ignore
@@ -735,11 +867,271 @@ export def "wt clone" [
 
     print ""
     print $"(ansi green)($CHECK) Repository setup complete!(ansi reset)"
-    print $"(ansi cyan)   Bare repo: ($dest)(ansi reset)"
+    print $"(ansi cyan)   Project root: ($destination_path)(ansi reset)"
+    print $"(ansi cyan)   Bare repo: ($bare_repo_path)(ansi reset)"
     print $"(ansi cyan)   Main worktree: ($main_path)(ansi reset)"
     print ""
-    print $"(ansi yellow)To start working, run:(ansi reset)"
-    print $"   cd ($bare_name)/($WORKTREE_FOLDER)/($main_branch)"
+    print $"(ansi yellow)($INFO) The project root \(($repo_name)/\) is a container — work inside worktree directories.(ansi reset)"
+    print ""
+
+    let response = (input "Do you want to navigate to the main worktree? (Y/n) ")
+    if not ($response =~ '^[Nn]$') {
+        cd $main_path
+    }
+}
+
+# Migrate classic (trees/) layout to modern (.git) layout
+export def "wt migrate" [] {
+    let ctx = (wt-context)
+    if $ctx == null { return }
+
+    # Precondition: must be classic layout
+    if $ctx.layout_type == "modern" {
+        print $"(ansi green)($CHECK) This repository already uses the modern layout(ansi reset)"
+        print $"(ansi cyan)   Bare repo: ($ctx.project_dir)(ansi reset)"
+        print $"(ansi cyan)   Project root: ($ctx.project_root)(ansi reset)"
+        return
+    }
+
+    # Compute new paths
+    let old_root = $ctx.project_dir
+    let old_root_name = ($old_root | path basename)
+    let new_root_name = ($old_root_name | str replace --regex '\.git$' '')
+    let new_root = (($old_root | path dirname) | path join $new_root_name)
+    let new_bare_repo = ($new_root | path join ".git")
+
+    # Check for collision
+    if ($new_root | path exists) {
+        print $"(ansi red)($CROSS) Error: Directory '($new_root_name)' already exists(ansi reset)"
+        print $"(ansi yellow)   Cannot migrate — the target directory is taken(ansi reset)"
+        return
+    }
+
+    # Parse worktrees
+    let parsed_worktrees = (parse-worktrees $ctx.project_dir)
+    let default_branch_val = (default-branch $ctx.project_dir)
+
+    mut worktrees_to_move = []
+    mut external_worktrees = []
+
+    for wt in $parsed_worktrees {
+        if $wt.is_bare { continue }
+        let normalized_wt = ($wt.path | path expand | str downcase)
+        let normalized_old = ($old_root | path expand | str downcase)
+        if ($normalized_wt | str starts-with $"($normalized_old)/") or ($normalized_wt | str starts-with $"($normalized_old)\\") {
+            $worktrees_to_move = ($worktrees_to_move | append $wt)
+        } else {
+            $external_worktrees = ($external_worktrees | append $wt)
+        }
+    }
+
+    # Resolve worktree folder for new layout (null = not configured, "" = explicitly empty)
+    let configured = (get-worktree-folder)
+    let worktree_folder = if $configured != null {
+        $configured
+    } else {
+        ""
+    }
+
+    # Check for uncommitted changes
+    mut dirty_worktrees = []
+    for wt in $worktrees_to_move {
+        let status = (^git -C $wt.path status --porcelain | complete)
+        if $status.exit_code == 0 and ($status.stdout | str trim) != "" {
+            let changed_files = ($status.stdout | lines | where { |l| ($l | str trim) != "" } | length)
+            $dirty_worktrees = ($dirty_worktrees | append { name: $wt.name, changed_files: $changed_files })
+        }
+    }
+
+    # Show migration preview
+    print $"(ansi blue)=== Migration Preview ===(ansi reset)"
+    print ""
+    print $"(ansi cyan)Current layout \(classic\):(ansi reset)"
+    print $"(ansi white)  Bare repo: ($old_root)(ansi reset)"
+    for wt in $worktrees_to_move {
+        print $"(ansi white)  Worktree: ($wt.name) → ($wt.path)(ansi reset)"
+    }
+    if not ($external_worktrees | is-empty) {
+        print $"(ansi yellow)  External worktrees \(will NOT be moved\):(ansi reset)"
+        for wt in $external_worktrees {
+            print $"(ansi yellow)    ($wt.name) → ($wt.path)(ansi reset)"
+        }
+    }
+
+    print ""
+    print $"(ansi cyan)New layout \(modern\):(ansi reset)"
+    print $"(ansi white)  Project root: ($new_root)(ansi reset)"
+    print $"(ansi white)  Bare repo: ($new_bare_repo)(ansi reset)"
+    for wt in $worktrees_to_move {
+        let new_path = if $worktree_folder != "" {
+            ($new_root | path join $worktree_folder | path join $wt.name)
+        } else {
+            ($new_root | path join $wt.name)
+        }
+        print $"(ansi white)  Worktree: ($wt.name) → ($new_path)(ansi reset)"
+    }
+    print ""
+
+    # Warn about uncommitted changes
+    if not ($dirty_worktrees | is-empty) {
+        print $"(ansi yellow)($WARNING) The following worktrees have uncommitted changes:(ansi reset)"
+        for dw in $dirty_worktrees {
+            print $"  (ansi red)($CROSS) ($dw.name) \(($dw.changed_files) modified files\)(ansi reset)"
+        }
+        print ""
+        print $"(ansi yellow)Uncommitted changes will be preserved during migration, but if anything(ansi reset)"
+        print $"(ansi yellow)goes wrong they could be lost.(ansi reset)"
+        print ""
+    }
+
+    let response = (input "Are you sure you want to migrate? (y/N) ")
+    if not ($response =~ '^[Yy]$') {
+        print $"(ansi red)($CROSS) Cancelled(ansi reset)"
+        return
+    }
+
+    # CWD safety: move out of the repo being migrated
+    let saved_location = $env.PWD
+    let normalized_pwd = ($env.PWD | path expand | str downcase)
+    let normalized_old_root = ($old_root | path expand | str downcase)
+    if $normalized_pwd == $normalized_old_root or ($normalized_pwd | str starts-with $"($normalized_old_root)/") or ($normalized_pwd | str starts-with $"($normalized_old_root)\\") {
+        let parent_dir = ($old_root | path dirname)
+        cd $parent_dir
+        print $"(ansi cyan)($INFO) Changed directory to ($parent_dir) \(required for migration\)(ansi reset)"
+    }
+
+    print ""
+    print $"(ansi blue)=== Migrating to modern layout ===(ansi reset)"
+
+    # Step a: Create new project root
+    print $"  Creating project root '($new_root_name)'..."
+    try {
+        mkdir $new_root
+        print $"(ansi green)  ($CHECK) Project root created(ansi reset)"
+    } catch {
+        print $"(ansi red)  ($CROSS) Failed to create project root(ansi reset)"
+        return
+    }
+
+    # Step b: Create worktree subfolder if configured
+    if $worktree_folder != "" {
+        let worktree_subfolder = ($new_root | path join $worktree_folder)
+        mkdir $worktree_subfolder
+    }
+
+    # Step c: Move worktrees
+    mut new_worktree_paths = []
+    for wt in $worktrees_to_move {
+        let new_path = if $worktree_folder != "" {
+            ($new_root | path join $worktree_folder | path join $wt.name)
+        } else {
+            ($new_root | path join $wt.name)
+        }
+
+        print $"  Moving worktree '($wt.name)'..."
+        try {
+            mv $wt.path $new_path
+            print $"(ansi green)  ($CHECK) Moved '($wt.name)'(ansi reset)"
+            $new_worktree_paths = ($new_worktree_paths | append $new_path)
+        } catch {
+            print $"(ansi red)  ($CROSS) Failed to move '($wt.name)'(ansi reset)"
+            print $"(ansi red)($CROSS) Migration failed. The old directory is still intact at: ($old_root)(ansi reset)"
+            print $"(ansi yellow)   Clean up the partial migration directory: ($new_root)(ansi reset)"
+            return
+        }
+    }
+
+    # Add external worktree paths (they haven't moved but need repair)
+    for wt in $external_worktrees {
+        $new_worktree_paths = ($new_worktree_paths | append $wt.path)
+    }
+
+    # Step d: Move bare repo to .git
+    print $"  Moving bare repo to ($new_bare_repo)..."
+    try {
+        mkdir $new_bare_repo
+
+        # Move all items from old root to new .git, skip empty directories
+        let items = (ls -a $old_root | where { |item| $item.name != "." and $item.name != ".." })
+        for item in $items {
+            if $item.type == "dir" {
+                let remaining = (ls -a $item.name | where { |i| ($i.name | path basename) != "." and ($i.name | path basename) != ".." })
+                if ($remaining | is-empty) {
+                    # Empty directory (likely the old worktree folder after moves)
+                    rm -rf $item.name
+                    continue
+                }
+            }
+            mv $item.name $new_bare_repo
+        }
+        print $"(ansi green)  ($CHECK) Bare repo moved(ansi reset)"
+    } catch {
+        print $"(ansi red)  ($CROSS) Failed to move bare repo(ansi reset)"
+        print $"(ansi red)($CROSS) Migration failed during bare repo move.(ansi reset)"
+        print $"(ansi yellow)   Old directory: ($old_root)(ansi reset)"
+        print $"(ansi yellow)   New directory: ($new_root)(ansi reset)"
+        print $"(ansi yellow)   Manual recovery may be needed.(ansi reset)"
+        return
+    }
+
+    # Step e: Set config values
+    ^git -C $new_bare_repo config core.bare true | complete | ignore
+    ^git -C $new_bare_repo config wt.layout modern | complete | ignore
+
+    # Step f: Repair worktree cross-references
+    print "  Repairing worktree references..."
+    let repair_result = (^git -C $new_bare_repo worktree repair ...$new_worktree_paths | complete)
+    if $repair_result.exit_code == 0 {
+        print $"(ansi green)  ($CHECK) Worktree references repaired(ansi reset)"
+    } else {
+        print $"(ansi yellow)  ($WARNING) Worktree repair had issues \(check manually\)(ansi reset)"
+    }
+
+    # Step g: Verify
+    print "  Verifying migration..."
+    let verify = (^git -C $new_bare_repo worktree list | complete)
+    if $verify.exit_code == 0 and ($verify.stdout | str trim) != "" {
+        print $"(ansi green)  ($CHECK) Migration verified(ansi reset)"
+    } else {
+        print $"(ansi yellow)  ($WARNING) Verification failed — check worktree list manually(ansi reset)"
+    }
+
+    # Step h: Remove old directory
+    print "  Removing old directory..."
+    try {
+        rm -rf $old_root
+        print $"(ansi green)  ($CHECK) Old directory removed(ansi reset)"
+    } catch {
+        print $"(ansi yellow)  ($WARNING) Could not remove old directory: ($old_root)(ansi reset)"
+        print $"(ansi yellow)   You may need to remove it manually(ansi reset)"
+    }
+
+    # Success
+    print ""
+    print $"(ansi green)($CHECK) Migration complete!(ansi reset)"
+    print $"(ansi cyan)   Project root: ($new_root)(ansi reset)"
+    print $"(ansi cyan)   Bare repo: ($new_bare_repo)(ansi reset)"
+    print ""
+
+    # Find the default branch worktree for cd offer
+    mut default_worktree_path: string = ""
+    for wt in $worktrees_to_move {
+        if ($wt.branch == $default_branch_val or $wt.name == $default_branch_val) {
+            $default_worktree_path = if $worktree_folder != "" {
+                ($new_root | path join $worktree_folder | path join $wt.name)
+            } else {
+                ($new_root | path join $wt.name)
+            }
+            break
+        }
+    }
+
+    if $default_worktree_path != "" and ($default_worktree_path | path exists) {
+        let cd_response = (input "Do you want to navigate to the main worktree? (Y/n) ")
+        if not ($cd_response =~ '^[Nn]$') {
+            cd $default_worktree_path
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------

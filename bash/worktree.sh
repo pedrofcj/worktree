@@ -19,13 +19,40 @@ _WT_SEARCH="🔍"
 
 # --- Configuration ---
 _WT_DEFAULT_BRANCH_TYPE="feature"
-_WT_WORKTREE_FOLDER="trees"
+
+# Read worktree folder configuration from env var or ~/.wtconfig
+# Returns empty string if not configured (caller applies layout-dependent default)
+_wt_get_worktree_folder() {
+    # Priority 1: environment variable (empty string is a valid value)
+    if [[ -n "${WT_WORKTREE_FOLDER+x}" ]]; then
+        echo "$WT_WORKTREE_FOLDER"
+        return 0
+    fi
+
+    # Priority 2: ~/.wtconfig file
+    if [[ -f "$HOME/.wtconfig" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*worktree_folder[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
+                local val="${BASH_REMATCH[1]}"
+                # Trim trailing whitespace
+                val="${val%"${val##*[![:space:]]}"}"
+                echo "$val"
+                return 0
+            fi
+        done < "$HOME/.wtconfig"
+    fi
+
+    # Not configured
+    return 1
+}
 
 # --- Internal state ---
 _wt_last_progress_length=0
 _wt_project_dir=""
 _wt_project_name=""
 _wt_worktree_parent=""
+_wt_project_root=""
+_wt_layout_type=""
 
 # ============================================================================
 # Progress helpers
@@ -105,6 +132,30 @@ _wt_branch_exists() {
     git -C "$repo" show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null && return 0
     git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null && return 0
     return 1
+}
+
+# Validate worktree name against reserved names and path rules
+_wt_validate_name() {
+    local name="$1"
+    local reserved
+    for reserved in ".git" ".bare" ".."; do
+        if [[ "$name" == "$reserved" ]]; then
+            printf '%s\n' "$(_red "${_WT_CROSS} Error: '${name}' is a reserved name and cannot be used as a worktree name")"
+            return 1
+        fi
+    done
+
+    if [[ "$name" == */* || "$name" == *\\* ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Error: Worktree name '${name}' cannot contain path separators")"
+        return 1
+    fi
+
+    if [[ -n "$_WT_WORKTREE_FOLDER" && "$name" == "$_WT_WORKTREE_FOLDER" ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Error: '${name}' conflicts with the configured worktree folder name")"
+        return 1
+    fi
+
+    return 0
 }
 
 # Get the default branch name from remote (outputs to stdout)
@@ -202,6 +253,33 @@ _wt_get_git_root() {
     return 1
 }
 
+# Detect repository layout (modern vs classic) and set _wt_layout_type and _wt_project_root
+_wt_get_project_layout() {
+    # Primary detection: check for wt.layout git config
+    local layout_config
+    layout_config=$(git -C "$_wt_project_dir" config --get wt.layout 2>/dev/null)
+    if [[ $? -eq 0 && -n "$layout_config" ]]; then
+        _wt_layout_type="$layout_config"
+        if [[ "$layout_config" == "modern" ]]; then
+            _wt_project_root=$(dirname "$_wt_project_dir")
+        else
+            _wt_project_root="$_wt_project_dir"
+        fi
+        return
+    fi
+
+    # Fallback heuristic: check if bare repo dir name is exactly ".git"
+    local leaf_name
+    leaf_name=$(basename "$_wt_project_dir")
+    if [[ "$leaf_name" == ".git" ]]; then
+        _wt_layout_type="modern"
+        _wt_project_root=$(dirname "$_wt_project_dir")
+    else
+        _wt_layout_type="classic"
+        _wt_project_root="$_wt_project_dir"
+    fi
+}
+
 # ============================================================================
 # Help
 # ============================================================================
@@ -220,24 +298,28 @@ _wt_help() {
     printf '  %s          %s\n' "$(_green "remove-all")" "Remove all worktrees (with confirmation)"
     printf '  %s           %s\n' "$(_green "fix-fetch")" "Fix fetch refspec configuration for bare repos"
     printf '  %s         %s\n' "$(_green "clone <url>")" "Clone a repo as bare and set up worktree structure"
+    printf '  %s             %s\n' "$(_green "migrate")" "Migrate a classic (trees/) layout to modern (.git) layout"
     echo
     printf '%s\n' "$(_cyan "When creating a worktree:")"
-    echo "  • Worktree is created at trees/<name>"
     echo "  • Branch name format: <type>/<name> (default type is 'feature')"
     echo "  • If the branch doesn't exist, it creates a new branch"
     echo "  • If the branch already exists, it checks out the existing branch"
     echo "  • Use --from to base the new branch on another worktree's branch"
     echo
     printf '%s\n' "$(_cyan "Examples:")"
-    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RDUCH-123-add-serialization")" "# Creates trees/RDUCH-123-add-serialization with branch feature/RDUCH-123-add-serialization"
-    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RTJK-1223332-whatever bug")" "# Creates trees/RTJK-1223332-whatever with branch bug/RTJK-1223332-whatever"
-    printf '  %s\n    %s\n' "$(_yellow "${cmd} add look-at-this wowdude")" "# Creates trees/look-at-this with branch wowdude/look-at-this"
-    printf '  %s\n    %s\n' "$(_yellow "${cmd} add my-fix --from other-tree")" "# Creates trees/my-fix branching from other-tree's branch"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} clone https://github.com/user/repo.git")" "# Clone repo as bare and set up main worktree"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RDUCH-123-add-serialization")" "# Creates worktree with branch feature/RDUCH-123-add-serialization"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add RTJK-1223332-whatever bug")" "# Creates worktree with branch bug/RTJK-1223332-whatever"
+    printf '  %s\n    %s\n' "$(_yellow "${cmd} add my-fix --from other-tree")" "# Creates worktree branching from other-tree's branch"
     printf '  %s  %s\n' "$(_yellow "${cmd} list")" "# List all worktrees (shows current with ${_WT_STAR})"
     printf '  %s  %s\n' "$(_yellow "${cmd} remove my-feature")" "# Remove specific worktree"
     printf '  %s  %s\n' "$(_yellow "${cmd} remove-all")" "# Remove all worktrees"
     printf '  %s  %s\n' "$(_yellow "${cmd} fix-fetch")" "# Fix fetch refspec configuration"
-    printf '  %s\n    %s\n' "$(_yellow "${cmd} clone https://github.com/user/repo.git")" "# Clone repo as bare and set up main worktree"
+    printf '  %s  %s\n' "$(_yellow "${cmd} migrate")" "# Migrate classic layout to modern layout"
+    echo
+    printf '%s\n' "$(_cyan "Configuration (~/.wtconfig or environment variables):")"
+    printf '  %s  %s\n' "$(_green "command_name / WT_RENAME")" "Set custom command name"
+    printf '  %s  %s\n' "$(_green "worktree_folder / WT_WORKTREE_FOLDER")" "Set worktree subfolder (default: project root)"
     echo
 }
 
@@ -365,7 +447,7 @@ _wt_init_main_worktree() {
         git -C "$_wt_project_dir" worktree add "$main_path" "$main_branch" &>/dev/null
 
         if [[ $? -eq 0 ]]; then
-            _wt_progress_complete "Worktree created at ${_WT_WORKTREE_FOLDER}/${main_branch}" "success"
+            _wt_progress_complete "Worktree created at ${main_path}" "success"
             worktree_created=true
         else
             _wt_progress_complete "Failed to create ${main_branch} worktree" "error"
@@ -430,6 +512,11 @@ _wt_add() {
     if [[ -z "$worktree_name" ]]; then
         printf '%s\n' "$(_red "${_WT_CROSS} Error: Please specify a name for the worktree")"
         printf '%s\n' "$(_yellow "   Usage: ${cmd} add <name> [type] [--from <worktree>]")"
+        return 1
+    fi
+
+    # Validate worktree name
+    if ! _wt_validate_name "$worktree_name"; then
         return 1
     fi
 
@@ -696,7 +783,7 @@ _wt_remove_all() {
     printf '%s\n' "$(_green "${_WT_CHECK} All worktrees removed")"
 }
 
-# Clone repository as bare and set up worktree structure
+# Clone repository as bare with modern layout
 _wt_clone() {
     local repo_url="$1"
     local cmd="${_WT_COMMAND_NAME:-wt}"
@@ -710,48 +797,59 @@ _wt_clone() {
     # Extract repo name from URL (handles both HTTPS and SSH formats)
     local repo_name="${repo_url%.git}"
     repo_name="${repo_name##*[/:]}"
-    local bare_name="${repo_name}.git"
-    local dest="${PWD}/${bare_name}"
+    local destination_path="${PWD}/${repo_name}"
+    local bare_repo_path="${destination_path}/.git"
 
-    if [[ -d "$dest" ]]; then
-        printf '%s\n' "$(_red "${_WT_CROSS} Error: Directory '${bare_name}' already exists")"
+    if [[ -d "$destination_path" ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Error: Directory '${repo_name}' already exists")"
         printf '%s\n' "$(_yellow "   Please remove it or choose a different location")"
         return 1
     fi
 
     printf '%s\n' "$(_blue "=== Cloning repository as bare ===")"
     printf '%s\n' "$(_cyan "   URL: ${repo_url}")"
-    printf '%s\n' "$(_cyan "   Destination: ./${bare_name}")"
+    printf '%s\n' "$(_cyan "   Destination: ./${repo_name}")"
     echo
 
-    # Clone with --bare flag
+    # Create project root directory
+    mkdir -p "$destination_path"
+
+    # Clone with --bare flag into .git subdirectory
     _wt_progress_start "Cloning repository"
     local clone_output
-    clone_output=$(git clone --bare "$repo_url" "$dest" 2>&1)
+    clone_output=$(git clone --bare "$repo_url" "$bare_repo_path" 2>&1)
 
     if [[ $? -ne 0 ]]; then
         _wt_progress_complete "Failed to clone repository" "error"
         printf '%s\n' "$(_yellow "   Error: ${clone_output}")"
+        # Clean up the empty directory
+        rm -rf "$destination_path" 2>/dev/null
         return 1
     fi
     _wt_progress_complete "Repository cloned" "success"
 
+    # Ensure core.bare is explicitly set (safety for .git directory name)
+    git -C "$bare_repo_path" config core.bare true &>/dev/null
+
+    # Set layout marker
+    git -C "$bare_repo_path" config wt.layout modern &>/dev/null
+
     # Configure fetch refspec for bare repo
-    _wt_set_fetch_refspec "$dest"
+    _wt_set_fetch_refspec "$bare_repo_path"
 
     # Fetch all branches
     _wt_progress_start "Fetching all branches"
-    git -C "$dest" fetch --all &>/dev/null
+    git -C "$bare_repo_path" fetch --all &>/dev/null
     if [[ $? -eq 0 ]]; then
         _wt_progress_complete "Fetched all branches" "success"
     else
         _wt_progress_complete "Failed to fetch all branches (continuing anyway)" "warning"
     fi
 
-    # Detect default branch
+    # Detect default branch dynamically
     _wt_progress_start "Detecting default branch"
     local main_branch
-    main_branch=$(_wt_get_default_branch "$dest")
+    main_branch=$(_wt_get_default_branch "$bare_repo_path")
 
     if [[ -z "$main_branch" ]]; then
         _wt_progress_complete "Failed to detect default branch" "error"
@@ -761,19 +859,33 @@ _wt_clone() {
     fi
     _wt_progress_complete "Found default branch: ${main_branch}" "success"
 
-    # Create trees folder and default branch worktree
-    local trees_path="${dest}/${_WT_WORKTREE_FOLDER}"
-    mkdir -p "$trees_path"
+    # Resolve worktree folder from config (no layout context needed - modern default is "")
+    local worktree_folder
+    if worktree_folder=$(_wt_get_worktree_folder); then
+        : # use configured value
+    else
+        worktree_folder=""
+    fi
 
-    local main_wt_path="${trees_path}/${main_branch}"
+    # Compute worktree parent
+    local worktree_parent
+    if [[ -n "$worktree_folder" ]]; then
+        worktree_parent="${destination_path}/${worktree_folder}"
+        mkdir -p "$worktree_parent"
+    else
+        worktree_parent="$destination_path"
+    fi
+
+    # Create worktree for default branch
+    local main_wt_path="${worktree_parent}/${main_branch}"
     _wt_progress_start "Creating worktree for ${main_branch} branch"
-    git -C "$dest" worktree add "$main_wt_path" "$main_branch" &>/dev/null
+    git -C "$bare_repo_path" worktree add "$main_wt_path" "$main_branch" &>/dev/null
 
     if [[ $? -ne 0 ]]; then
         _wt_progress_complete "Failed to create worktree for ${main_branch}" "error"
         return 1
     fi
-    _wt_progress_complete "Worktree created at ${_WT_WORKTREE_FOLDER}/${main_branch}" "success"
+    _wt_progress_complete "Worktree created at ${main_wt_path}" "success"
 
     # Set upstream tracking
     _wt_set_upstream "$main_wt_path" "$main_branch"
@@ -789,11 +901,17 @@ _wt_clone() {
 
     echo
     printf '%s\n' "$(_green "${_WT_CHECK} Repository setup complete!")"
-    printf '%s\n' "$(_cyan "   Bare repo: ${dest}")"
+    printf '%s\n' "$(_cyan "   Project root: ${destination_path}")"
+    printf '%s\n' "$(_cyan "   Bare repo: ${bare_repo_path}")"
     printf '%s\n' "$(_cyan "   Main worktree: ${main_wt_path}")"
     echo
-    printf '%s\n' "$(_yellow "To start working, run:")"
-    echo "   cd ${bare_name}/${_WT_WORKTREE_FOLDER}/${main_branch}"
+    printf '%s\n' "$(_yellow "${_WT_INFO} The project root (${repo_name}/) is a container — work inside worktree directories.")"
+    echo
+
+    read -rp "Do you want to navigate to the main worktree? (Y/n) " response
+    if [[ ! "$response" =~ ^[Nn]$ ]]; then
+        cd "$main_wt_path" || return 1
+    fi
 }
 
 # Fix fetch refspec configuration
@@ -843,6 +961,291 @@ _wt_fix_fetch() {
     fi
 }
 
+# Migrate classic layout to modern layout
+_wt_migrate() {
+    # Precondition: must be classic layout
+    if [[ "$_wt_layout_type" == "modern" ]]; then
+        printf '%s\n' "$(_green "${_WT_CHECK} This repository already uses the modern layout")"
+        printf '%s\n' "$(_cyan "   Bare repo: ${_wt_project_dir}")"
+        printf '%s\n' "$(_cyan "   Project root: ${_wt_project_root}")"
+        return
+    fi
+
+    # Compute new paths
+    local old_root="$_wt_project_dir"
+    local old_root_name
+    old_root_name=$(basename "$old_root")
+    local new_root_name="${old_root_name%.git}"
+    local parent_dir
+    parent_dir=$(dirname "$old_root")
+    local new_root="${parent_dir}/${new_root_name}"
+    local new_bare_repo="${new_root}/.git"
+
+    # Check for collision
+    if [[ -d "$new_root" ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Error: Directory '${new_root_name}' already exists")"
+        printf '%s\n' "$(_yellow "   Cannot migrate — the target directory is taken")"
+        return
+    fi
+
+    # Parse worktrees
+    local worktrees
+    worktrees=$(_wt_get_parsed_worktrees)
+    local default_branch
+    default_branch=$(_wt_get_default_branch)
+
+    # Classify worktrees as internal (inside old_root) or external
+    local -a move_paths=() move_names=() move_branches=()
+    local -a ext_paths=() ext_names=()
+
+    if [[ -n "$worktrees" ]]; then
+        # Normalize old_root for comparison (lowercase, no trailing slash)
+        local norm_old_root
+        norm_old_root=$(echo "$old_root" | tr '[:upper:]' '[:lower:]')
+        norm_old_root="${norm_old_root%/}"
+
+        while IFS=$'\t' read -r wt_path wt_branch wt_name wt_bare; do
+            [[ "$wt_bare" == "true" ]] && continue
+
+            # Normalize worktree path for case-insensitive comparison
+            local norm_wt_path
+            norm_wt_path=$(echo "$wt_path" | tr '[:upper:]' '[:lower:]')
+            norm_wt_path="${norm_wt_path%/}"
+
+            if [[ "$norm_wt_path" == "${norm_old_root}/"* ]]; then
+                move_paths+=("$wt_path")
+                move_names+=("$wt_name")
+                move_branches+=("$wt_branch")
+            else
+                ext_paths+=("$wt_path")
+                ext_names+=("$wt_name")
+            fi
+        done <<< "$worktrees"
+    fi
+
+    # Resolve worktree folder for new layout (null = not configured, "" = explicitly empty)
+    local worktree_folder
+    if worktree_folder=$(_wt_get_worktree_folder); then
+        : # use configured value
+    else
+        worktree_folder=""
+    fi
+
+    # Check for uncommitted changes
+    local -a dirty_names=() dirty_counts=()
+    local i
+    for i in "${!move_paths[@]}"; do
+        local status_output
+        status_output=$(git -C "${move_paths[$i]}" status --porcelain 2>/dev/null)
+        if [[ -n "$status_output" ]]; then
+            local changed_files
+            changed_files=$(echo "$status_output" | wc -l)
+            changed_files="${changed_files// /}"
+            dirty_names+=("${move_names[$i]}")
+            dirty_counts+=("$changed_files")
+        fi
+    done
+
+    # Show migration preview
+    printf '%s\n' "$(_blue "=== Migration Preview ===")"
+    echo
+    printf '%s\n' "$(_cyan "Current layout (classic):")"
+    printf '  %s\n' "Bare repo: ${old_root}"
+    for i in "${!move_paths[@]}"; do
+        printf '  %s\n' "Worktree: ${move_names[$i]} → ${move_paths[$i]}"
+    done
+    if [[ ${#ext_paths[@]} -gt 0 ]]; then
+        printf '%s\n' "$(_yellow "  External worktrees (will NOT be moved):")"
+        for i in "${!ext_paths[@]}"; do
+            printf '%s\n' "$(_yellow "    ${ext_names[$i]} → ${ext_paths[$i]}")"
+        done
+    fi
+
+    echo
+    printf '%s\n' "$(_cyan "New layout (modern):")"
+    printf '  %s\n' "Project root: ${new_root}"
+    printf '  %s\n' "Bare repo: ${new_bare_repo}"
+    for i in "${!move_names[@]}"; do
+        local new_path
+        if [[ -n "$worktree_folder" ]]; then
+            new_path="${new_root}/${worktree_folder}/${move_names[$i]}"
+        else
+            new_path="${new_root}/${move_names[$i]}"
+        fi
+        printf '  %s\n' "Worktree: ${move_names[$i]} → ${new_path}"
+    done
+    echo
+
+    # Warn about uncommitted changes
+    if [[ ${#dirty_names[@]} -gt 0 ]]; then
+        printf '%s\n' "$(_yellow "${_WT_WARNING} The following worktrees have uncommitted changes:")"
+        for i in "${!dirty_names[@]}"; do
+            printf '  %s\n' "$(_red "${_WT_CROSS} ${dirty_names[$i]} (${dirty_counts[$i]} modified files)")"
+        done
+        echo
+        printf '%s\n' "$(_yellow "Uncommitted changes will be preserved during migration, but if anything")"
+        printf '%s\n' "$(_yellow "goes wrong they could be lost.")"
+        echo
+    fi
+
+    read -rp "Are you sure you want to migrate? (y/N) " response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Cancelled")"
+        return
+    fi
+
+    # CWD safety: move out of the repo being migrated
+    local saved_location="$PWD"
+    local norm_pwd
+    norm_pwd=$(echo "$PWD" | tr '[:upper:]' '[:lower:]')
+    norm_pwd="${norm_pwd%/}"
+    local norm_check
+    norm_check=$(echo "$old_root" | tr '[:upper:]' '[:lower:]')
+    norm_check="${norm_check%/}"
+    if [[ "$norm_pwd" == "$norm_check" || "$norm_pwd" == "${norm_check}/"* ]]; then
+        cd "$parent_dir" || return 1
+        printf '%s\n' "$(_cyan "${_WT_INFO} Changed directory to ${parent_dir} (required for migration)")"
+    fi
+
+    echo
+    printf '%s\n' "$(_blue "=== Migrating to modern layout ===")"
+
+    # Step a: Create new project root
+    _wt_progress_start "Creating project root '${new_root_name}'"
+    if mkdir -p "$new_root" 2>/dev/null; then
+        _wt_progress_complete "Project root created" "success"
+    else
+        _wt_progress_complete "Failed to create project root" "error"
+        return
+    fi
+
+    # Step b: Create worktree subfolder if configured
+    if [[ -n "$worktree_folder" ]]; then
+        mkdir -p "${new_root}/${worktree_folder}" 2>/dev/null
+    fi
+
+    # Step c: Move worktrees
+    local -a new_worktree_paths=()
+    for i in "${!move_paths[@]}"; do
+        local new_path
+        if [[ -n "$worktree_folder" ]]; then
+            new_path="${new_root}/${worktree_folder}/${move_names[$i]}"
+        else
+            new_path="${new_root}/${move_names[$i]}"
+        fi
+
+        _wt_progress_start "Moving worktree '${move_names[$i]}'"
+        if mv "${move_paths[$i]}" "$new_path" 2>/dev/null; then
+            _wt_progress_complete "Moved '${move_names[$i]}'" "success"
+            new_worktree_paths+=("$new_path")
+        else
+            _wt_progress_complete "Failed to move '${move_names[$i]}'" "error"
+            printf '%s\n' "$(_red "${_WT_CROSS} Migration failed. The old directory is still intact at: ${old_root}")"
+            printf '%s\n' "$(_yellow "   Clean up the partial migration directory: ${new_root}")"
+            return
+        fi
+    done
+
+    # Add external worktree paths (they haven't moved but need repair)
+    for i in "${!ext_paths[@]}"; do
+        new_worktree_paths+=("${ext_paths[$i]}")
+    done
+
+    # Step d: Move bare repo to .git
+    _wt_progress_start "Moving bare repo to ${new_bare_repo}"
+    if mkdir -p "$new_bare_repo" 2>/dev/null; then
+        # Move all items from old root to new .git
+        # Skip any empty directories left behind after worktree moves
+        local move_failed=false
+        for item in "$old_root"/*  "$old_root"/.[!.]* "$old_root"/..?*; do
+            [[ -e "$item" ]] || continue
+            if [[ -d "$item" ]]; then
+                # Check if directory is empty (likely old worktree folder after moves)
+                if [[ -z "$(ls -A "$item" 2>/dev/null)" ]]; then
+                    rmdir "$item" 2>/dev/null
+                    continue
+                fi
+            fi
+            if ! mv "$item" "$new_bare_repo/" 2>/dev/null; then
+                move_failed=true
+                break
+            fi
+        done
+
+        if $move_failed; then
+            _wt_progress_complete "Failed to move bare repo" "error"
+            printf '%s\n' "$(_red "${_WT_CROSS} Migration failed during bare repo move.")"
+            printf '%s\n' "$(_yellow "   Old directory: ${old_root}")"
+            printf '%s\n' "$(_yellow "   New directory: ${new_root}")"
+            printf '%s\n' "$(_yellow "   Manual recovery may be needed.")"
+            return
+        fi
+        _wt_progress_complete "Bare repo moved" "success"
+    else
+        _wt_progress_complete "Failed to create .git directory" "error"
+        return
+    fi
+
+    # Step e: Set config values
+    git -C "$new_bare_repo" config core.bare true &>/dev/null
+    git -C "$new_bare_repo" config wt.layout modern &>/dev/null
+
+    # Step f: Repair worktree cross-references
+    _wt_progress_start "Repairing worktree references"
+    git -C "$new_bare_repo" worktree repair "${new_worktree_paths[@]}" &>/dev/null
+    if [[ $? -eq 0 ]]; then
+        _wt_progress_complete "Worktree references repaired" "success"
+    else
+        _wt_progress_complete "Worktree repair had issues (check manually)" "warning"
+    fi
+
+    # Step g: Verify
+    _wt_progress_start "Verifying migration"
+    local verify_output
+    verify_output=$(git -C "$new_bare_repo" worktree list 2>/dev/null)
+    if [[ $? -eq 0 && -n "$verify_output" ]]; then
+        _wt_progress_complete "Migration verified" "success"
+    else
+        _wt_progress_complete "Verification failed — check worktree list manually" "warning"
+    fi
+
+    # Step h: Remove old directory
+    _wt_progress_start "Removing old directory"
+    if rm -rf "$old_root" 2>/dev/null; then
+        _wt_progress_complete "Old directory removed" "success"
+    else
+        _wt_progress_complete "Could not remove old directory: ${old_root}" "warning"
+        printf '%s\n' "$(_yellow "   You may need to remove it manually")"
+    fi
+
+    # Success
+    echo
+    printf '%s\n' "$(_green "${_WT_CHECK} Migration complete!")"
+    printf '%s\n' "$(_cyan "   Project root: ${new_root}")"
+    printf '%s\n' "$(_cyan "   Bare repo: ${new_bare_repo}")"
+    echo
+
+    # Find the default branch worktree for cd offer
+    local default_wt_path=""
+    for i in "${!move_names[@]}"; do
+        if [[ "${move_branches[$i]}" == "$default_branch" || "${move_names[$i]}" == "$default_branch" ]]; then
+            if [[ -n "$worktree_folder" ]]; then
+                default_wt_path="${new_root}/${worktree_folder}/${move_names[$i]}"
+            else
+                default_wt_path="${new_root}/${move_names[$i]}"
+            fi
+            break
+        fi
+    done
+
+    if [[ -n "$default_wt_path" && -d "$default_wt_path" ]]; then
+        read -rp "Do you want to navigate to the main worktree? (Y/n) " response
+        if [[ ! "$response" =~ ^[Nn]$ ]]; then
+            cd "$default_wt_path" || return 1
+        fi
+    fi
+}
+
 # ============================================================================
 # Main entry point
 # ============================================================================
@@ -868,8 +1271,28 @@ wt() {
     if [[ -z "$_wt_project_dir" ]]; then
         return 1
     fi
-    _wt_project_name=$(basename "$_wt_project_dir")
-    _wt_worktree_parent="${_wt_project_dir}/${_WT_WORKTREE_FOLDER}"
+
+    # Detect layout and set project root
+    _wt_get_project_layout
+
+    _wt_project_name=$(basename "$_wt_project_root")
+
+    # Resolve worktree folder: config > layout default
+    local configured_folder
+    if configured_folder=$(_wt_get_worktree_folder); then
+        _WT_WORKTREE_FOLDER="$configured_folder"
+    elif [[ "$_wt_layout_type" == "classic" ]]; then
+        _WT_WORKTREE_FOLDER="trees"
+    else
+        _WT_WORKTREE_FOLDER=""
+    fi
+
+    # Compute worktree parent path
+    if [[ -n "$_WT_WORKTREE_FOLDER" ]]; then
+        _wt_worktree_parent="${_wt_project_root}/${_WT_WORKTREE_FOLDER}"
+    else
+        _wt_worktree_parent="$_wt_project_root"
+    fi
 
     case "$command" in
         add)        _wt_add "$@" ;;
@@ -877,6 +1300,7 @@ wt() {
         remove)     _wt_remove "$*" ;;
         remove-all) _wt_remove_all ;;
         fix-fetch)  _wt_fix_fetch ;;
+        migrate)    _wt_migrate ;;
         *)
             printf '%s\n' "$(_red "${_WT_CROSS} Error: Unknown command '${command}'")"
             printf '%s\n' "$(_yellow "   Run '${_WT_COMMAND_NAME:-wt} --help' to see available commands")"
