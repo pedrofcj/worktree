@@ -309,6 +309,30 @@ function Test-BranchExists {
     return $false
 }
 
+# Validate worktree name against reserved names and path rules
+function Test-ValidWorktreeName {
+    param([string]$Name)
+
+    $reservedNames = @(".git", ".bare", "..")
+
+    if ($Name -in $reservedNames) {
+        Write-Host "${script:CROSS} Error: '${Name}' is a reserved name and cannot be used as a worktree name" -ForegroundColor Red
+        return $false
+    }
+
+    if ($Name -match '[/\\]') {
+        Write-Host "${script:CROSS} Error: Worktree name '${Name}' cannot contain path separators" -ForegroundColor Red
+        return $false
+    }
+
+    if ($script:WORKTREE_FOLDER -and $Name -eq $script:WORKTREE_FOLDER) {
+        Write-Host "${script:CROSS} Error: '${Name}' conflicts with the configured worktree folder name" -ForegroundColor Red
+        return $false
+    }
+
+    return $true
+}
+
 # Get the default branch name from remote
 function Get-DefaultBranch {
     param(
