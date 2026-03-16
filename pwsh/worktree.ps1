@@ -999,8 +999,28 @@ function wt {
     if (-not $script:PROJECT_DIR) {
         return
     }
-    $script:PROJECT_NAME = Split-Path -Leaf $script:PROJECT_DIR
-    $script:WORKTREE_PARENT = Join-Path $script:PROJECT_DIR "trees"
+
+    # Detect layout and set PROJECT_ROOT
+    Get-ProjectLayout
+
+    $script:PROJECT_NAME = Split-Path -Leaf $script:PROJECT_ROOT
+
+    # Resolve worktree folder: config > layout default
+    $configuredFolder = Get-WorktreeFolder
+    if ($null -ne $configuredFolder) {
+        $script:WORKTREE_FOLDER = $configuredFolder
+    } elseif ($script:LAYOUT_TYPE -eq "classic") {
+        $script:WORKTREE_FOLDER = "trees"
+    } else {
+        $script:WORKTREE_FOLDER = ""
+    }
+
+    # Compute worktree parent path
+    if ($script:WORKTREE_FOLDER) {
+        $script:WORKTREE_PARENT = Join-Path $script:PROJECT_ROOT $script:WORKTREE_FOLDER
+    } else {
+        $script:WORKTREE_PARENT = $script:PROJECT_ROOT
+    }
     
     $command = $Arguments[0]
     $remainingArgs = @()
@@ -1025,6 +1045,9 @@ function wt {
         }
         "fix-fetch" {
             Repair-FetchRefspec | Out-Null
+        }
+        "migrate" {
+            Convert-ToModernLayout
         }
         default {
             Write-Host "${script:CROSS} Error: Unknown command '${command}'" -ForegroundColor Red
