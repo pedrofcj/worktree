@@ -840,6 +840,263 @@ function Repair-FetchRefspec {
     }
 }
 
+# Migrate classic layout to modern layout
+function Convert-ToModernLayout {
+    # Precondition: must be classic layout
+    if ($script:LAYOUT_TYPE -eq "modern") {
+        Write-Host "${script:CHECK} This repository already uses the modern layout" -ForegroundColor Green
+        Write-Host "   Bare repo: $script:PROJECT_DIR" -ForegroundColor Cyan
+        Write-Host "   Project root: $script:PROJECT_ROOT" -ForegroundColor Cyan
+        return
+    }
+
+    # Compute new paths
+    $oldRoot = $script:PROJECT_DIR
+    $oldRootName = Split-Path -Leaf $oldRoot
+    $newRootName = $oldRootName -replace '\.git$', ''
+    $newRoot = Join-Path (Split-Path -Parent $oldRoot) $newRootName
+    $newBareRepo = Join-Path $newRoot ".git"
+
+    # Check for collision
+    if (Test-Path $newRoot) {
+        Write-Host "${script:CROSS} Error: Directory '${newRootName}' already exists" -ForegroundColor Red
+        Write-Host "   Cannot migrate — the target directory is taken" -ForegroundColor Yellow
+        return
+    }
+
+    # Parse worktrees
+    $parsedWorktrees = Get-ParsedWorktrees
+    $worktreesToMove = @()
+    $externalWorktrees = @()
+    $defaultBranch = Get-DefaultBranch
+
+    foreach ($wt in $parsedWorktrees) {
+        if ($wt.IsBare) { continue }
+        $normalizedWtPath = ($wt.Path -replace '/', '\').TrimEnd('\')
+        $normalizedOldRoot = ($oldRoot -replace '/', '\').TrimEnd('\')
+        # Case-insensitive check with trailing separator to avoid prefix-overlap
+        # (e.g., "MyProject.git" must not match "MyProject.git-backup")
+        if ($normalizedWtPath.StartsWith($normalizedOldRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $worktreesToMove += $wt
+        } else {
+            $externalWorktrees += $wt
+        }
+    }
+
+    # Resolve worktree folder for new layout (null = not configured, "" = explicitly empty)
+    $worktreeFolder = Get-WorktreeFolder
+    if ($null -eq $worktreeFolder) {
+        $worktreeFolder = ""
+    }
+
+    # Check for uncommitted changes
+    $dirtyWorktrees = @()
+    foreach ($wt in $worktreesToMove) {
+        $status = git -C $wt.Path status --porcelain 2>$null
+        if ($status) {
+            $changedFiles = ($status | Measure-Object).Count
+            $dirtyWorktrees += [PSCustomObject]@{
+                Name = $wt.Name
+                ChangedFiles = $changedFiles
+            }
+        }
+    }
+
+    # Show migration preview
+    Write-Host "=== Migration Preview ===" -ForegroundColor Blue
+    Write-Host ""
+    Write-Host "Current layout (classic):" -ForegroundColor Cyan
+    Write-Host "  Bare repo: ${oldRoot}" -ForegroundColor White
+    foreach ($wt in $worktreesToMove) {
+        Write-Host "  Worktree: $($wt.Name) → $($wt.Path)" -ForegroundColor White
+    }
+    if ($externalWorktrees.Count -gt 0) {
+        Write-Host "  External worktrees (will NOT be moved):" -ForegroundColor Yellow
+        foreach ($wt in $externalWorktrees) {
+            Write-Host "    $($wt.Name) → $($wt.Path)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    Write-Host "New layout (modern):" -ForegroundColor Cyan
+    Write-Host "  Project root: ${newRoot}" -ForegroundColor White
+    Write-Host "  Bare repo: ${newBareRepo}" -ForegroundColor White
+    foreach ($wt in $worktreesToMove) {
+        if ($worktreeFolder) {
+            $newPath = Join-Path $newRoot (Join-Path $worktreeFolder $wt.Name)
+        } else {
+            $newPath = Join-Path $newRoot $wt.Name
+        }
+        Write-Host "  Worktree: $($wt.Name) → ${newPath}" -ForegroundColor White
+    }
+    Write-Host ""
+
+    # Warn about uncommitted changes
+    if ($dirtyWorktrees.Count -gt 0) {
+        Write-Host "${script:WARNING} The following worktrees have uncommitted changes:" -ForegroundColor Yellow
+        foreach ($dw in $dirtyWorktrees) {
+            Write-Host "  ${script:CROSS} $($dw.Name) ($($dw.ChangedFiles) modified files)" -ForegroundColor Red
+        }
+        Write-Host ""
+        Write-Host "Uncommitted changes will be preserved during migration, but if anything" -ForegroundColor Yellow
+        Write-Host "goes wrong they could be lost." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $response = Read-Host "Are you sure you want to migrate? (y/N)"
+    if ($response -notmatch '^[Yy]$') {
+        Write-Host "${script:CROSS} Cancelled" -ForegroundColor Red
+        return
+    }
+
+    # CWD safety: move out of the repo being migrated (Windows directory locking)
+    $savedLocation = $PWD.Path
+    $normalizedPwd = ($PWD.Path -replace '/', '\').TrimEnd('\')
+    $normalizedOldRoot = ($oldRoot -replace '/', '\').TrimEnd('\')
+    if ($normalizedPwd -eq $normalizedOldRoot -or
+        $normalizedPwd.StartsWith($normalizedOldRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $parentDir = Split-Path -Parent $oldRoot
+        Set-Location $parentDir
+        Write-Host "${script:INFO} Changed directory to ${parentDir} (required for migration)" -ForegroundColor Cyan
+    }
+
+    Write-Host ""
+    Write-Host "=== Migrating to modern layout ===" -ForegroundColor Blue
+
+    # Step a: Create new project root
+    Write-ProgressStart "Creating project root '${newRootName}'"
+    try {
+        New-Item -ItemType Directory -Path $newRoot -Force | Out-Null
+        Write-ProgressComplete "Project root created" -Status "success"
+    } catch {
+        Write-ProgressComplete "Failed to create project root: $_" -Status "error"
+        return
+    }
+
+    # Step b: Create worktree subfolder if configured
+    if ($worktreeFolder) {
+        $worktreeSubfolder = Join-Path $newRoot $worktreeFolder
+        New-Item -ItemType Directory -Path $worktreeSubfolder -Force | Out-Null
+    }
+
+    # Step c: Move worktrees
+    $newWorktreePaths = @()
+    foreach ($wt in $worktreesToMove) {
+        if ($worktreeFolder) {
+            $newPath = Join-Path $newRoot (Join-Path $worktreeFolder $wt.Name)
+        } else {
+            $newPath = Join-Path $newRoot $wt.Name
+        }
+
+        Write-ProgressStart "Moving worktree '$($wt.Name)'"
+        try {
+            Move-Item -Path $wt.Path -Destination $newPath -Force
+            Write-ProgressComplete "Moved '$($wt.Name)'" -Status "success"
+            $newWorktreePaths += $newPath
+        } catch {
+            Write-ProgressComplete "Failed to move '$($wt.Name)': $_" -Status "error"
+            Write-Host "${script:CROSS} Migration failed. The old directory is still intact at: ${oldRoot}" -ForegroundColor Red
+            Write-Host "   Clean up the partial migration directory: ${newRoot}" -ForegroundColor Yellow
+            return
+        }
+    }
+
+    # Add external worktree paths (they haven't moved but need repair)
+    foreach ($wt in $externalWorktrees) {
+        $newWorktreePaths += $wt.Path
+    }
+
+    # Step d: Move bare repo to .git
+    Write-ProgressStart "Moving bare repo to ${newBareRepo}"
+    try {
+        New-Item -ItemType Directory -Path $newBareRepo -Force | Out-Null
+
+        # Move all items from old root to new .git
+        # Skip any empty directories left behind after worktree moves
+        $itemsToMove = Get-ChildItem -Path $oldRoot -Force
+        foreach ($item in $itemsToMove) {
+            if ($item.PSIsContainer) {
+                $remaining = Get-ChildItem -Path $item.FullName -Force
+                if (-not $remaining) {
+                    # Empty directory (likely the old worktree folder after moves)
+                    Remove-Item -Path $item.FullName -Force
+                    continue
+                }
+            }
+            Move-Item -Path $item.FullName -Destination $newBareRepo -Force
+        }
+        Write-ProgressComplete "Bare repo moved" -Status "success"
+    } catch {
+        Write-ProgressComplete "Failed to move bare repo: $_" -Status "error"
+        Write-Host "${script:CROSS} Migration failed during bare repo move." -ForegroundColor Red
+        Write-Host "   Old directory: ${oldRoot}" -ForegroundColor Yellow
+        Write-Host "   New directory: ${newRoot}" -ForegroundColor Yellow
+        Write-Host "   Manual recovery may be needed." -ForegroundColor Yellow
+        return
+    }
+
+    # Step e: Set config values
+    git -C $newBareRepo config core.bare true 2>$null | Out-Null
+    git -C $newBareRepo config wt.layout modern 2>$null | Out-Null
+
+    # Step f: Repair worktree cross-references
+    Write-ProgressStart "Repairing worktree references"
+    $repairArgs = @("-C", $newBareRepo, "worktree", "repair") + $newWorktreePaths
+    git @repairArgs 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-ProgressComplete "Worktree references repaired" -Status "success"
+    } else {
+        Write-ProgressComplete "Worktree repair had issues (check manually)" -Status "warning"
+    }
+
+    # Step g: Verify
+    Write-ProgressStart "Verifying migration"
+    $verifyOutput = git -C $newBareRepo worktree list 2>$null
+    if ($LASTEXITCODE -eq 0 -and $verifyOutput) {
+        Write-ProgressComplete "Migration verified" -Status "success"
+    } else {
+        Write-ProgressComplete "Verification failed — check worktree list manually" -Status "warning"
+    }
+
+    # Step h: Remove old directory
+    Write-ProgressStart "Removing old directory"
+    try {
+        # Old root should be empty or nearly empty after moving everything
+        Remove-Item -Path $oldRoot -Force -Recurse -ErrorAction Stop
+        Write-ProgressComplete "Old directory removed" -Status "success"
+    } catch {
+        Write-ProgressComplete "Could not remove old directory: ${oldRoot}" -Status "warning"
+        Write-Host "   You may need to remove it manually" -ForegroundColor Yellow
+    }
+
+    # Success
+    Write-Host ""
+    Write-Host "${script:CHECK} Migration complete!" -ForegroundColor Green
+    Write-Host "   Project root: ${newRoot}" -ForegroundColor Cyan
+    Write-Host "   Bare repo: ${newBareRepo}" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Find the default branch worktree for cd offer
+    $defaultWorktreePath = $null
+    foreach ($wt in $worktreesToMove) {
+        if ($wt.Branch -eq $defaultBranch -or $wt.Name -eq $defaultBranch) {
+            if ($worktreeFolder) {
+                $defaultWorktreePath = Join-Path $newRoot (Join-Path $worktreeFolder $wt.Name)
+            } else {
+                $defaultWorktreePath = Join-Path $newRoot $wt.Name
+            }
+            break
+        }
+    }
+
+    if ($defaultWorktreePath -and (Test-Path $defaultWorktreePath)) {
+        $response = Read-Host "Do you want to navigate to the main worktree? (Y/n)"
+        if ($response -notmatch '^[Nn]$') {
+            Set-Location $defaultWorktreePath
+        }
+    }
+}
+
 # Create worktree
 function New-Worktree {
     param([string[]]$Arguments)
