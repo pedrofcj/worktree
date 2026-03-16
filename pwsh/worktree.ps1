@@ -200,6 +200,31 @@ function Get-GitRoot {
     return $null
 }
 
+# Detect repository layout (modern vs classic) and set PROJECT_ROOT
+function Get-ProjectLayout {
+    # Primary detection: check for wt.layout git config
+    $layoutConfig = git -C $script:PROJECT_DIR config --get wt.layout 2>$null
+    if ($LASTEXITCODE -eq 0 -and $layoutConfig) {
+        $script:LAYOUT_TYPE = $layoutConfig
+        if ($layoutConfig -eq "modern") {
+            $script:PROJECT_ROOT = Split-Path -Parent $script:PROJECT_DIR
+        } else {
+            $script:PROJECT_ROOT = $script:PROJECT_DIR
+        }
+        return
+    }
+
+    # Fallback heuristic: check if bare repo dir name is exactly ".git"
+    $leafName = Split-Path -Leaf $script:PROJECT_DIR
+    if ($leafName -eq ".git") {
+        $script:LAYOUT_TYPE = "modern"
+        $script:PROJECT_ROOT = Split-Path -Parent $script:PROJECT_DIR
+    } else {
+        $script:LAYOUT_TYPE = "classic"
+        $script:PROJECT_ROOT = $script:PROJECT_DIR
+    }
+}
+
 # Show help
 function Show-WorktreeHelp {
     $cmd = $script:WT_COMMAND_NAME
