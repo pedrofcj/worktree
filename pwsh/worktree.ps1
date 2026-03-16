@@ -850,6 +850,11 @@ function New-Worktree {
         return
     }
 
+    # Validate worktree name
+    if (-not (Test-ValidWorktreeName -Name $worktreeName)) {
+        return
+    }
+
     # Resolve --from source branch
     $startPoint = $null
     if ($fromWorktree) {
