@@ -14,6 +14,30 @@ $script:SEARCH = "🔍"
 $script:DEFAULT_BRANCH_TYPE = "feature"
 $script:WORKTREE_FOLDER = "trees"
 
+# Read worktree folder configuration from env var or ~/.wtconfig
+# Returns $null if not configured (caller applies layout-dependent default)
+# Note: uses $null -ne check, NOT truthiness, because "" is a valid config value
+# (meaning "worktrees directly in project root")
+function Get-WorktreeFolder {
+    # Priority 1: environment variable (empty string is a valid value)
+    if ($null -ne $env:WT_WORKTREE_FOLDER) {
+        return $env:WT_WORKTREE_FOLDER
+    }
+
+    # Priority 2: ~/.wtconfig file
+    $wtConfigPath = Join-Path $HOME ".wtconfig"
+    if (Test-Path $wtConfigPath) {
+        foreach ($line in (Get-Content $wtConfigPath)) {
+            if ($line -match '^\s*worktree_folder\s*=\s*(.+)\s*$') {
+                return $Matches[1].Trim()
+            }
+        }
+    }
+
+    # Not configured
+    return $null
+}
+
 # Progress message helpers
 $script:LastProgressLength = 0
 
