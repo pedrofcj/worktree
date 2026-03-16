@@ -2,6 +2,20 @@
 
 All notable changes to the Git Worktree Manager will be documented in this file.
 
+## 2026-03-16
+
+### Added
+- **Modern layout for `clone`**: `wt clone <url>` now creates `RepoName/` with the bare repo hidden inside `.git`, instead of `RepoName.git/`. Worktrees are created as siblings to `.git` (e.g., `RepoName/main/`), giving a cleaner project structure.
+- **`migrate` command**: Converts an existing classic (`RepoName.git/trees/`) layout to the modern (`RepoName/.git/`) layout. Shows a preview, warns about uncommitted changes, handles Windows directory locking, and runs `git worktree repair` automatically.
+- **Layout auto-detection**: All commands automatically detect whether a repo uses modern or classic layout. Existing classic repos continue to work unchanged — no migration required.
+- **Configurable worktree subfolder**: Set `WT_WORKTREE_FOLDER` environment variable or `worktree_folder` in `~/.wtconfig` to place worktrees in a subfolder (e.g., `worktree_folder = trees` restores the old behavior for new clones).
+- **Worktree name validation**: Rejects reserved names (`.git`, `.bare`, `..`), names with path separators, and names that conflict with the configured worktree folder.
+- **`wt clone` offers to `cd`**: After cloning, prompts to navigate into the default branch worktree (like `wt add` already does).
+
+### Changed
+- **PowerShell only** for now — bash/zsh/nushell will follow in a separate update.
+- Help text updated with `migrate` command, modern layout examples, and configuration reference.
+
 ## 2026-03-15
 
 ### Added

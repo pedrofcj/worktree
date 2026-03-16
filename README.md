@@ -45,6 +45,7 @@ source /path/to/nushell/worktree.nu
 | `wt remove <name>` | Remove a specific worktree and its branch |
 | `wt remove-all` | Remove all non-default worktrees (with confirmation) |
 | `wt fix-fetch` | Fix fetch refspec configuration for bare repos |
+| `wt migrate` | Migrate a classic layout to modern layout |
 
 ### Examples
 
@@ -55,13 +56,37 @@ wt add my-fix bug                            # branch: bug/my-fix
 wt add hotfix --from my-feature              # branch: feature/hotfix, based on my-feature
 wt list                                      # Show all worktrees
 wt remove my-feature                         # Remove worktree and branch
+wt migrate                                   # Convert classic layout to modern
 ```
+
+## Project Layout
+
+When you run `wt clone`, the repo is set up with a **modern layout**:
+
+```
+MyProject/
+  .git/            ← bare repo (hidden)
+  main/            ← default branch worktree
+  my-feature/      ← your worktrees live here
+```
+
+Existing repos using the **classic layout** (`MyProject.git/trees/`) continue to work. You can convert them with `wt migrate`.
+
+> **Note:** The modern layout is currently PowerShell-only. Bash, Zsh, and Nushell still use the classic layout and will be updated in a future release.
 
 ## Configuration
 
+All configuration is optional. Settings can be placed in `~/.wtconfig` or set via environment variables. Priority: environment variable > config file > default.
+
+```ini
+# ~/.wtconfig
+command_name = gw
+worktree_folder = trees
+```
+
 ### Rename the command
 
-By default the command is `wt`. To change it, use either:
+By default the command is `wt`. To change it:
 
 **Environment variable:**
 ```powershell
@@ -80,4 +105,22 @@ $env.WT_RENAME = "gw"
 command_name = gw
 ```
 
-Priority: environment variable > config file > default (`wt`).
+### Worktree subfolder
+
+By default, modern-layout repos place worktrees directly in the project root. To use a subfolder instead:
+
+**Environment variable:**
+```powershell
+# PowerShell
+$env:WT_WORKTREE_FOLDER = "trees"
+
+# Bash / Zsh
+export WT_WORKTREE_FOLDER="trees"
+```
+
+**Config file** (`~/.wtconfig`):
+```ini
+worktree_folder = trees
+```
+
+This creates worktrees at `MyProject/trees/<name>/` instead of `MyProject/<name>/`. Classic-layout repos default to `trees/` for backward compatibility.
