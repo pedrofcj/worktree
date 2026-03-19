@@ -1219,10 +1219,8 @@ _wt_migrate() {
 
     # Resolve worktree folder for new layout (null = not configured, "" = explicitly empty)
     local worktree_folder=""
-    local worktree_folder_configured=false
     if _wt_get_worktree_folder > /dev/null 2>&1; then
         worktree_folder=$(_wt_get_worktree_folder)
-        worktree_folder_configured=true
     fi
 
     # Check for uncommitted changes in worktrees to move
@@ -1289,7 +1287,6 @@ _wt_migrate() {
     fi
 
     # CWD safety: move out of the repo being migrated
-    local saved_location="$PWD"
     if [[ "${PWD:l}" == "${old_root:l}" || "${PWD:l}" == "${old_root:l}/"* ]]; then
         cd "$parent_dir" || return 1
         printf '%s\n' "$(_cyan "${_WT_INFO} Changed directory to ${parent_dir} (required for migration)")"

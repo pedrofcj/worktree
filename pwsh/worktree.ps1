@@ -1196,7 +1196,6 @@ function Convert-ToModernLayout {
     }
 
     # CWD safety: move out of the repo being migrated (Windows directory locking)
-    $savedLocation = $PWD.Path
     $normalizedPwd = ($PWD.Path -replace '/', '\').TrimEnd('\')
     $normalizedOldRoot = ($oldRoot -replace '/', '\').TrimEnd('\')
     if ($normalizedPwd -eq $normalizedOldRoot -or

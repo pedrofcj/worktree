@@ -1324,7 +1324,6 @@ _wt_migrate() {
     fi
 
     # CWD safety: move out of the repo being migrated
-    local saved_location="$PWD"
     local norm_pwd
     norm_pwd=$(echo "$PWD" | tr '[:upper:]' '[:lower:]')
     norm_pwd="${norm_pwd%/}"

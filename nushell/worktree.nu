@@ -1277,7 +1277,6 @@ export def "wt migrate" [] {
     }
 
     # CWD safety: move out of the repo being migrated
-    let saved_location = $env.PWD
     let normalized_pwd = ($env.PWD | path expand | str downcase)
     let normalized_old_root = ($old_root | path expand | str downcase)
     if $normalized_pwd == $normalized_old_root or ($normalized_pwd | str starts-with $"($normalized_old_root)/") or ($normalized_pwd | str starts-with $"($normalized_old_root)\\") {
