@@ -46,6 +46,8 @@ source /path/to/nushell/worktree.nu
 | `wt remove-all` | Remove all non-default worktrees (with confirmation) |
 | `wt fix-fetch` | Fix fetch refspec configuration for bare repos |
 | `wt migrate` | Migrate a classic layout to modern layout |
+| `wt update` | Check for updates and apply them |
+| `wt version` | Show current version |
 
 ### Examples
 
@@ -57,6 +59,8 @@ wt add hotfix --from my-feature              # branch: feature/hotfix, based on 
 wt list                                      # Show all worktrees
 wt remove my-feature                         # Remove worktree and branch
 wt migrate                                   # Convert classic layout to modern
+wt update                                    # Check for updates and apply
+wt version                                   # Show current version
 ```
 
 ## Project Layout
@@ -122,3 +126,28 @@ worktree_folder = trees
 ```
 
 This creates worktrees at `MyProject/trees/<name>/` instead of `MyProject/<name>/`. Classic-layout repos default to `trees/` for backward compatibility.
+
+### Auto-update
+
+The scripts check for updates once per day (on any `wt` command) and show a one-line notice if a newer version is available. Updates are compared by **version number**, not file hash — so any local customizations you make to the scripts won't trigger false update notifications.
+
+Run `wt update` to apply an update. You'll be warned that manual changes to the script files will be overwritten and prompted before anything changes.
+
+To disable the automatic check:
+
+**Environment variable:**
+```powershell
+# PowerShell
+$env:WT_AUTO_UPDATE = "false"
+
+# Bash / Zsh
+export WT_AUTO_UPDATE="false"
+
+# Nushell
+$env.WT_AUTO_UPDATE = "false"
+```
+
+**Config file** (`~/.wtconfig`):
+```ini
+auto_update = false
+```

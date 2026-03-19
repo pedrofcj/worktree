@@ -2,6 +2,15 @@
 
 All notable changes to the Git Worktree Manager will be documented in this file.
 
+## 1.3.0 — 2026-03-19
+
+### Added
+- **Auto-update**: Scripts now check for updates once per day and notify when a new version is available. Update checks compare version numbers (not file hashes), so local customizations don't trigger false positives.
+- **`wt update` command**: Fetches the latest version, shows a comparison, warns that manual changes will be overwritten, and prompts before applying. After updating, the script is automatically reloaded (Bash/Zsh/PowerShell) or the user is prompted to restart their shell (Nushell).
+- **`wt version` command**: Displays the current version (`wt version` or `wt --version`).
+- **`VERSION` file**: Single source of truth for the version number, stored at the repository root.
+- **`auto_update` configuration**: Disable the automatic update check via `WT_AUTO_UPDATE=false` environment variable or `auto_update = false` in `~/.wtconfig`.
+
 ## 2026-03-16
 
 ### Added

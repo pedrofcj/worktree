@@ -13,6 +13,20 @@ $script:SEARCH = "🔍"
 # Configuration
 $script:DEFAULT_BRANCH_TYPE = "feature"
 
+# Version tracking
+$script:WT_VERSION = "1.3.0"
+$script:WT_SCRIPT_DIR = $PSScriptRoot
+$script:WT_REPO_DIR = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { $null }
+if ($script:WT_REPO_DIR) {
+    $versionFile = Join-Path $script:WT_REPO_DIR "VERSION"
+    if (Test-Path $versionFile) {
+        $versionValue = (Get-Content $versionFile -TotalCount 1).Trim()
+        if ($versionValue) {
+            $script:WT_VERSION = $versionValue
+        }
+    }
+}
+
 # Read worktree folder configuration from env var or ~/.wtconfig
 # Returns $null if not configured (caller applies layout-dependent default)
 # Note: uses $null -ne check, NOT truthiness, because "" is a valid config value
@@ -224,6 +238,217 @@ function Get-ProjectLayout {
     }
 }
 
+# ============================================================================
+# Auto-update
+# ============================================================================
+
+# Check if auto-update is enabled (default: true)
+function Get-AutoUpdateConfig {
+    # Priority 1: environment variable
+    if ($null -ne $env:WT_AUTO_UPDATE) {
+        return ($env:WT_AUTO_UPDATE -ne "false")
+    }
+    # Priority 2: ~/.wtconfig file
+    $wtConfigPath = Join-Path $HOME ".wtconfig"
+    if (Test-Path $wtConfigPath) {
+        foreach ($line in (Get-Content $wtConfigPath)) {
+            if ($line -match '^\s*auto_update\s*=\s*(.+)\s*$') {
+                return ($Matches[1].Trim() -ne "false")
+            }
+        }
+    }
+    return $true
+}
+
+# Compare two semver strings. Returns -1 (v1 < v2), 0 (equal), 1 (v1 > v2)
+function Compare-WtVersion {
+    param([string]$v1, [string]$v2)
+    $parts1 = $v1 -split '\.' | ForEach-Object { [int]$_ }
+    $parts2 = $v2 -split '\.' | ForEach-Object { [int]$_ }
+    $maxLen = [Math]::Max($parts1.Count, $parts2.Count)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        $a = if ($i -lt $parts1.Count) { $parts1[$i] } else { 0 }
+        $b = if ($i -lt $parts2.Count) { $parts2[$i] } else { 0 }
+        if ($a -lt $b) { return -1 }
+        if ($a -gt $b) { return 1 }
+    }
+    return 0
+}
+
+# Resolve the wt scripts repository path
+function Get-WtRepoDir {
+    # Auto-detected from script location
+    if ($script:WT_REPO_DIR -and (Test-Path (Join-Path $script:WT_REPO_DIR ".git") -ErrorAction SilentlyContinue)) {
+        return $script:WT_REPO_DIR
+    }
+    # Environment variable override
+    if ($env:WT_REPO_DIR -and (Test-Path $env:WT_REPO_DIR -ErrorAction SilentlyContinue)) {
+        return $env:WT_REPO_DIR
+    }
+    # ~/.wtconfig fallback
+    $wtConfigPath = Join-Path $HOME ".wtconfig"
+    if (Test-Path $wtConfigPath) {
+        foreach ($line in (Get-Content $wtConfigPath)) {
+            if ($line -match '^\s*repo_dir\s*=\s*(.+)\s*$') {
+                $dir = $Matches[1].Trim()
+                if (Test-Path $dir) { return $dir }
+            }
+        }
+    }
+    return $null
+}
+
+# Read the remote version from the fetched origin
+function Get-WtRemoteVersion {
+    param([string]$RepoDir)
+
+    # Determine the remote default branch for the wt repo
+    $remoteBranch = git -C $RepoDir rev-parse --abbrev-ref origin/HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $remoteBranch -or $remoteBranch -eq "origin/HEAD") {
+        foreach ($branch in @("main", "master")) {
+            git -C $RepoDir show-ref --verify --quiet "refs/remotes/origin/$branch" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $remoteBranch = "origin/$branch"
+                break
+            }
+        }
+    }
+    if (-not $remoteBranch) { return $null }
+
+    $remoteVersion = git -C $RepoDir show "${remoteBranch}:VERSION" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $remoteVersion) { return $null }
+    return $remoteVersion.Trim()
+}
+
+# Throttled update check — notifies user when a new version is available
+function Test-WtUpdate {
+    if (-not (Get-AutoUpdateConfig)) { return }
+
+    $repoDir = Get-WtRepoDir
+    if (-not $repoDir) { return }
+
+    $cacheFile = Join-Path $HOME ".wt_update_check"
+    $now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+    if (Test-Path $cacheFile) {
+        try {
+            $cachedLines = @(Get-Content $cacheFile)
+            $lastCheck = [long]$cachedLines[0].Trim()
+            if (($now - $lastCheck) -lt 86400) {
+                # Within throttle window — show cached notice if update available
+                if ($cachedLines.Count -ge 2) {
+                    $cachedVersion = $cachedLines[1].Trim()
+                    if ($cachedVersion -and (Compare-WtVersion $script:WT_VERSION $cachedVersion) -lt 0) {
+                        Write-Host "${script:WARNING} Update available: v${script:WT_VERSION} $([char]0x2192) v${cachedVersion}. Run '$($script:WT_COMMAND_NAME) update' to update." -ForegroundColor Yellow
+                    }
+                }
+                return
+            }
+        } catch {
+            # Corrupt cache file, continue with fresh check
+        }
+    }
+
+    # Fetch silently
+    git -C $repoDir fetch origin --quiet 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        # Network error — update timestamp to avoid retry flood
+        Set-Content -Path $cacheFile -Value $now
+        return
+    }
+
+    $remoteVersion = Get-WtRemoteVersion -RepoDir $repoDir
+    if (-not $remoteVersion) {
+        Set-Content -Path $cacheFile -Value $now
+        return
+    }
+
+    # Write cache: line 1 = timestamp, line 2 = remote version
+    Set-Content -Path $cacheFile -Value @($now, $remoteVersion)
+
+    if ((Compare-WtVersion $script:WT_VERSION $remoteVersion) -lt 0) {
+        Write-Host "${script:WARNING} Update available: v${script:WT_VERSION} $([char]0x2192) v${remoteVersion}. Run '$($script:WT_COMMAND_NAME) update' to update." -ForegroundColor Yellow
+    }
+}
+
+# Update the wt scripts to the latest version
+function Update-WtScript {
+    Write-Host "=== Checking for updates ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    $repoDir = Get-WtRepoDir
+    if (-not $repoDir) {
+        Write-Host "${script:CROSS} Cannot determine the wt repository location" -ForegroundColor Red
+        Write-Host "   Set the WT_REPO_DIR environment variable or add 'repo_dir = /path/to/wt' to ~/.wtconfig" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "${script:INFO} Repository: ${repoDir}" -ForegroundColor Cyan
+    Write-Host "${script:INFO} Current version: v${script:WT_VERSION}" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Fetch latest
+    Write-ProgressStart "Fetching latest version"
+    git -C $repoDir fetch origin --quiet 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-ProgressComplete "Failed to fetch updates (check your network connection)" -Status "error"
+        return
+    }
+    Write-ProgressComplete "Fetched latest version" -Status "success"
+
+    $remoteVersion = Get-WtRemoteVersion -RepoDir $repoDir
+    if (-not $remoteVersion) {
+        Write-Host "${script:CROSS} Could not determine remote version" -ForegroundColor Red
+        return
+    }
+
+    # Update cache
+    $now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $cacheFile = Join-Path $HOME ".wt_update_check"
+    Set-Content -Path $cacheFile -Value @($now, $remoteVersion)
+
+    $comparison = Compare-WtVersion $script:WT_VERSION $remoteVersion
+    if ($comparison -ge 0) {
+        Write-Host "${script:CHECK} Already up to date (v${script:WT_VERSION})" -ForegroundColor Green
+        return
+    }
+
+    Write-Host "${script:INFO} Latest version:  v${remoteVersion}" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "${script:WARNING} Updating will overwrite any manual changes you've made to the script files." -ForegroundColor Yellow
+    Write-Host ""
+
+    $response = Read-Host "Do you want to update? (y/N)"
+    if ($response -notmatch '^[Yy]$') {
+        Write-Host "${script:CROSS} Update cancelled" -ForegroundColor Red
+        return
+    }
+
+    # Pull updates
+    Write-ProgressStart "Updating scripts"
+    git -C $repoDir pull 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-ProgressComplete "Failed to pull updates" -Status "error"
+        Write-Host "   You may have local changes that conflict. Resolve them in:" -ForegroundColor Yellow
+        Write-Host "   ${repoDir}" -ForegroundColor Yellow
+        return
+    }
+    Write-ProgressComplete "Scripts updated to v${remoteVersion}" -Status "success"
+
+    # Re-source the script to load the new version
+    Write-ProgressStart "Reloading script"
+    try {
+        $scriptPath = Join-Path $script:WT_SCRIPT_DIR "worktree.ps1"
+        . $scriptPath
+        Write-ProgressComplete "Script reloaded (v${script:WT_VERSION})" -Status "success"
+    } catch {
+        Write-ProgressComplete "Failed to reload — restart your shell to use the new version" -Status "warning"
+    }
+
+    Write-Host ""
+    Write-Host "${script:CHECK} Successfully updated to v${remoteVersion}!" -ForegroundColor Green
+}
+
 # Show help
 function Show-WorktreeHelp {
     $cmd = $script:WT_COMMAND_NAME
@@ -256,6 +481,12 @@ function Show-WorktreeHelp {
     Write-Host "  " -NoNewline
     Write-Host "migrate" -ForegroundColor Green -NoNewline
     Write-Host "             Migrate a classic (trees/) layout to modern (.git) layout"
+    Write-Host "  " -NoNewline
+    Write-Host "update" -ForegroundColor Green -NoNewline
+    Write-Host "              Check for updates and apply them"
+    Write-Host "  " -NoNewline
+    Write-Host "version" -ForegroundColor Green -NoNewline
+    Write-Host "             Show current version"
     Write-Host ""
     Write-Host "When creating a worktree:" -ForegroundColor Cyan
     Write-Host "  • Branch name format: <type>/<name> (default type is 'feature')"
@@ -291,12 +522,20 @@ function Show-WorktreeHelp {
     Write-Host "  " -NoNewline
     Write-Host "${cmd} migrate" -ForegroundColor Yellow -NoNewline
     Write-Host "                         # Migrate classic layout to modern layout"
+    Write-Host "  " -NoNewline
+    Write-Host "${cmd} update" -ForegroundColor Yellow -NoNewline
+    Write-Host "                          # Check for updates and apply them"
+    Write-Host "  " -NoNewline
+    Write-Host "${cmd} version" -ForegroundColor Yellow -NoNewline
+    Write-Host "                         # Show current version"
     Write-Host ""
     Write-Host "Configuration (~/.wtconfig or environment variables):" -ForegroundColor Cyan
     Write-Host "  command_name / WT_RENAME              " -NoNewline -ForegroundColor Green
     Write-Host "Set custom command name"
     Write-Host "  worktree_folder / WT_WORKTREE_FOLDER  " -NoNewline -ForegroundColor Green
     Write-Host "Set worktree subfolder (default: project root)"
+    Write-Host "  auto_update / WT_AUTO_UPDATE          " -NoNewline -ForegroundColor Green
+    Write-Host "Enable/disable update check (default: true)"
     Write-Host ""
 }
 
@@ -1278,7 +1517,7 @@ function wt {
         return
     }
     
-    # Handle clone command separately (doesn't require being inside a git repo)
+    # Handle commands that don't require being inside a git repo
     if ($Arguments[0] -eq "clone") {
         $cloneArgs = @()
         if ($Arguments.Count -gt 1) {
@@ -1289,7 +1528,20 @@ function wt {
         New-BareRepository -Arguments $cloneArgs
         return
     }
-    
+
+    if ($Arguments[0] -eq "update") {
+        Update-WtScript
+        return
+    }
+
+    if ($Arguments[0] -in @("version", "--version")) {
+        Write-Host "v${script:WT_VERSION}" -ForegroundColor Cyan
+        return
+    }
+
+    # Auto-update check (throttled, silent on errors)
+    Test-WtUpdate
+
     # Initialize variables (requires being inside a git repo)
     $script:PROJECT_DIR = Get-GitRoot
     if (-not $script:PROJECT_DIR) {
@@ -1345,6 +1597,12 @@ function wt {
         "migrate" {
             Convert-ToModernLayout
         }
+        "update" {
+            Update-WtScript
+        }
+        "version" {
+            Write-Host "v${script:WT_VERSION}" -ForegroundColor Cyan
+        }
         default {
             Write-Host "${script:CROSS} Error: Unknown command '${command}'" -ForegroundColor Red
             Write-Host "   Run '$($script:WT_COMMAND_NAME) --help' to see available commands" -ForegroundColor Yellow
@@ -1372,5 +1630,10 @@ if (-not $script:WT_COMMAND_NAME) {
 
 # Rename function if configured
 if ($script:WT_COMMAND_NAME -ne "wt") {
-    Rename-Item -Path "function:wt" -NewName $script:WT_COMMAND_NAME
+    if (Get-Command $script:WT_COMMAND_NAME -CommandType Function -ErrorAction SilentlyContinue) {
+        Remove-Item -Path "function:$($script:WT_COMMAND_NAME)" -Force -ErrorAction SilentlyContinue
+    }
+    if (Get-Command wt -CommandType Function -ErrorAction SilentlyContinue) {
+        Rename-Item -Path "function:wt" -NewName $script:WT_COMMAND_NAME -Force -ErrorAction SilentlyContinue
+    }
 }

@@ -12,10 +12,25 @@ const SEARCH = "🔍"
 
 # Configuration
 const DEFAULT_BRANCH_TYPE = "feature"
+const WT_VERSION_FALLBACK = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+# Resolve home directory across Nushell versions
+def get-home-dir [] {
+    if ('home-path' in $nu) {
+        return $nu.home-path
+    }
+    if ('home' in $nu) {
+        return $nu.home
+    }
+    if 'HOME' in $env {
+        return $env.HOME
+    }
+    "~"
+}
 
 # Read worktree folder configuration from env var or ~/.wtconfig
 # Returns the configured value, or null if not configured
@@ -26,7 +41,7 @@ def get-worktree-folder [] {
     }
 
     # Priority 2: ~/.wtconfig file
-    let config_path = ($nu.home-path | path join ".wtconfig")
+    let config_path = ((get-home-dir) | path join ".wtconfig")
     if ($config_path | path exists) {
         let lines = (open $config_path | lines)
         for line in $lines {
@@ -127,7 +142,7 @@ def resolve-command-name [] {
     }
 
     # Check ~/.wtconfig file
-    let config_path = ($nu.home-path | path join ".wtconfig")
+    let config_path = ((get-home-dir) | path join ".wtconfig")
     if ($config_path | path exists) {
         let lines = (open $config_path | lines)
         for line in $lines {
@@ -147,6 +162,8 @@ def resolve-command-name [] {
 # Build a context record with layout-aware fields.
 # Returns null when not in a bare repo.
 def wt-context [] {
+    check-update
+
     let root = (get-git-root)
     if $root == null { return null }
 
@@ -372,6 +389,260 @@ def ensure-main-worktree [project_dir: string, worktree_parent: string] {
 }
 
 # ---------------------------------------------------------------------------
+# Auto-update
+# ---------------------------------------------------------------------------
+
+# Check if auto-update is enabled (default: true)
+def get-auto-update-config [] {
+    # Priority 1: environment variable
+    if "WT_AUTO_UPDATE" in $env {
+        return (($env.WT_AUTO_UPDATE | into string | str trim | str downcase) != "false")
+    }
+
+    # Priority 2: ~/.wtconfig file
+    let config_path = ((get-home-dir) | path join ".wtconfig")
+    if ($config_path | path exists) {
+        let lines = (open $config_path | lines)
+        for line in $lines {
+            let m = ($line | parse --regex '^\s*auto_update\s*=\s*(?P<val>.+)\s*$')
+            if not ($m | is-empty) {
+                let val = ($m | first | get val | str trim | str downcase)
+                return ($val != "false")
+            }
+        }
+    }
+
+    true
+}
+
+# Compare two semver strings. Returns -1 (v1 < v2), 0 (equal), 1 (v1 > v2)
+def compare-version [v1: string, v2: string] {
+    let parts1 = ($v1 | split row "." | each { |p| $p | into int })
+    let parts2 = ($v2 | split row "." | each { |p| $p | into int })
+
+    let len1 = ($parts1 | length)
+    let len2 = ($parts2 | length)
+    let max_len = if $len1 > $len2 { $len1 } else { $len2 }
+
+    if $max_len == 0 {
+        return 0
+    }
+
+    for i in 0..($max_len - 1) {
+        let a = if $i < $len1 { $parts1 | get $i } else { 0 }
+        let b = if $i < $len2 { $parts2 | get $i } else { 0 }
+
+        if $a < $b { return (-1) }
+        if $a > $b { return 1 }
+    }
+
+    0
+}
+
+# Resolve the wt scripts repository path
+def get-wt-repo-dir [] {
+    # Priority 1: environment variable
+    if "WT_REPO_DIR" in $env {
+        let env_dir = ($env.WT_REPO_DIR | into string | str trim)
+        if $env_dir != "" and ($env_dir | path exists) {
+            return $env_dir
+        }
+    }
+
+    # Priority 2: ~/.wtconfig fallback
+    let config_path = ((get-home-dir) | path join ".wtconfig")
+    if ($config_path | path exists) {
+        let lines = (open $config_path | lines)
+        for line in $lines {
+            let m = ($line | parse --regex '^\s*repo_dir\s*=\s*(?P<val>.+)\s*$')
+            if not ($m | is-empty) {
+                let dir = ($m | first | get val | str trim)
+                if $dir != "" and ($dir | path exists) {
+                    return $dir
+                }
+            }
+        }
+    }
+
+    null
+}
+
+# Read local version from VERSION file with fallback
+def get-wt-version [] {
+    let repo_dir = (get-wt-repo-dir)
+    if $repo_dir != null {
+        let version_file = ($repo_dir | path join "VERSION")
+        if ($version_file | path exists) {
+            let version = (open $version_file | lines | first | str trim)
+            if $version != "" {
+                return $version
+            }
+        }
+    }
+    $WT_VERSION_FALLBACK
+}
+
+# Read the remote version from fetched origin
+def get-remote-version [repo_dir: string] {
+    mut remote_branch = ""
+
+    let head = (^git -C $repo_dir rev-parse --abbrev-ref origin/HEAD | complete)
+    if $head.exit_code == 0 {
+        let val = ($head.stdout | str trim)
+        if $val != "" and $val != "origin/HEAD" {
+            $remote_branch = $val
+        }
+    }
+
+    if $remote_branch == "" {
+        for branch in ["main" "master"] {
+            let check = (^git -C $repo_dir show-ref --verify --quiet $"refs/remotes/origin/($branch)" | complete)
+            if $check.exit_code == 0 {
+                $remote_branch = $"origin/($branch)"
+                break
+            }
+        }
+    }
+
+    if $remote_branch == "" {
+        return null
+    }
+
+    let remote_version = (^git -C $repo_dir show $"($remote_branch):VERSION" | complete)
+    if $remote_version.exit_code != 0 {
+        return null
+    }
+
+    let version = ($remote_version.stdout | str trim)
+    if $version == "" {
+        return null
+    }
+
+    $version
+}
+
+# Throttled update check — notifies user when a new version is available
+def check-update [] {
+    if not (get-auto-update-config) { return }
+
+    let repo_dir = (get-wt-repo-dir)
+    if $repo_dir == null { return }
+
+    let cmd = (resolve-command-name)
+    let cache_file = ((get-home-dir) | path join ".wt_update_check")
+    let now = (date now | format date '%s' | into int)
+
+    let current_version = (get-wt-version)
+
+    if ($cache_file | path exists) {
+        try {
+            let cached_lines = (open $cache_file | lines)
+            if (($cached_lines | length) >= 1) {
+                let last_check = ($cached_lines | get 0 | str trim | into int)
+                if ($now - $last_check) < 86400 {
+                    if (($cached_lines | length) >= 2) {
+                        let cached_version = ($cached_lines | get 1 | str trim)
+                        if $cached_version != "" and (compare-version $current_version $cached_version) < 0 {
+                            print $"(ansi yellow)($WARNING) Update available: v($current_version) → v($cached_version). Run '($cmd) update' to update.(ansi reset)"
+                        }
+                    }
+                    return
+                }
+            }
+        } catch {
+            # Corrupt cache file, continue with fresh check
+        }
+    }
+
+    # Fetch silently
+    let fetch = (^git -C $repo_dir fetch origin --quiet | complete)
+    if $fetch.exit_code != 0 {
+        $"($now)" | save -f $cache_file
+        return
+    }
+
+    let remote_version = (get-remote-version $repo_dir)
+    if $remote_version == null {
+        $"($now)" | save -f $cache_file
+        return
+    }
+
+    # Cache format: line 1 = timestamp, line 2 = remote version
+    $"($now)\n($remote_version)" | save -f $cache_file
+
+    if (compare-version $current_version $remote_version) < 0 {
+        print $"(ansi yellow)($WARNING) Update available: v($current_version) → v($remote_version). Run '($cmd) update' to update.(ansi reset)"
+    }
+}
+
+# Update wt scripts to the latest version
+def wt-update [] {
+    print $"(ansi cyan)=== Checking for updates ===(ansi reset)"
+    print ""
+
+    let repo_dir = (get-wt-repo-dir)
+    if $repo_dir == null {
+        print $"(ansi red)($CROSS) Cannot determine the wt repository location(ansi reset)"
+        print $"(ansi yellow)   Set the WT_REPO_DIR environment variable or add 'repo_dir = /path/to/wt' to ~/.wtconfig(ansi reset)"
+        return
+    }
+
+    print $"(ansi cyan)($INFO) Repository: ($repo_dir)(ansi reset)"
+    let current_version = (get-wt-version)
+    print $"(ansi cyan)($INFO) Current version: v($current_version)(ansi reset)"
+    print ""
+
+    print "  Fetching latest version..."
+    let fetch = (^git -C $repo_dir fetch origin --quiet | complete)
+    if $fetch.exit_code != 0 {
+        print $"(ansi red)  ($CROSS) Failed to fetch updates \(check your network connection\)(ansi reset)"
+        return
+    }
+    print $"(ansi green)  ($CHECK) Fetched latest version(ansi reset)"
+
+    let remote_version = (get-remote-version $repo_dir)
+    if $remote_version == null {
+        print $"(ansi red)($CROSS) Could not determine remote version(ansi reset)"
+        return
+    }
+
+    # Update cache
+    let now = (date now | format date '%s' | into int)
+    let cache_file = ((get-home-dir) | path join ".wt_update_check")
+    $"($now)\n($remote_version)" | save -f $cache_file
+
+    if (compare-version $current_version $remote_version) >= 0 {
+        print $"(ansi green)($CHECK) Already up to date \(v($current_version)\)(ansi reset)"
+        return
+    }
+
+    print $"(ansi cyan)($INFO) Latest version:  v($remote_version)(ansi reset)"
+    print ""
+    print $"(ansi yellow)($WARNING) Updating will overwrite any manual changes you've made to the script files.(ansi reset)"
+    print ""
+
+    let response = (input "Do you want to update? (y/N) ")
+    if not ($response =~ '^[Yy]$') {
+        print $"(ansi red)($CROSS) Update cancelled(ansi reset)"
+        return
+    }
+
+    print "  Updating scripts..."
+    let pull = (^git -C $repo_dir pull | complete)
+    if $pull.exit_code != 0 {
+        print $"(ansi red)  ($CROSS) Failed to pull updates(ansi reset)"
+        print $"(ansi yellow)   You may have local changes that conflict. Resolve them in:(ansi reset)"
+        print $"(ansi yellow)   ($repo_dir)(ansi reset)"
+        return
+    }
+    print $"(ansi green)  ($CHECK) Scripts updated to v($remote_version)(ansi reset)"
+
+    print $"(ansi yellow)($WARNING) Restart your shell or re-source the script manually to load the new version.(ansi reset)"
+    print ""
+    print $"(ansi green)($CHECK) Successfully updated to v($remote_version)!(ansi reset)"
+}
+
+# ---------------------------------------------------------------------------
 # Exported commands
 # ---------------------------------------------------------------------------
 
@@ -391,6 +662,8 @@ export def wt [] {
     print $"  (ansi green)fix-fetch(ansi reset)           Fix fetch refspec configuration for bare repos"
     print $"  (ansi green)clone <url>(ansi reset)         Clone a repo as bare and set up worktree structure"
     print $"  (ansi green)migrate(ansi reset)             Migrate a classic \(trees/\) layout to modern \(.git\) layout"
+    print $"  (ansi green)update(ansi reset)              Check for updates and apply them"
+    print $"  (ansi green)version(ansi reset)             Show current version"
     print ""
     print $"(ansi cyan)When creating a worktree:(ansi reset)"
     print "  • Branch name format: <type>/<name> (default type is 'feature')"
@@ -409,11 +682,24 @@ export def wt [] {
     print $"  (ansi yellow)($cmd) remove-all(ansi reset)                        # Remove all worktrees"
     print $"  (ansi yellow)($cmd) fix-fetch(ansi reset)                        # Fix fetch refspec configuration"
     print $"  (ansi yellow)($cmd) migrate(ansi reset)                         # Migrate classic layout to modern layout"
+    print $"  (ansi yellow)($cmd) update(ansi reset)                          # Check for updates and apply them"
+    print $"  (ansi yellow)($cmd) version(ansi reset)                         # Show current version"
     print ""
     print $"(ansi cyan)Configuration \(~/.wtconfig or environment variables\):(ansi reset)"
     print $"  (ansi green)command_name / WT_RENAME(ansi reset)              Set custom command name"
     print $"  (ansi green)worktree_folder / WT_WORKTREE_FOLDER(ansi reset)  Set worktree subfolder \(default: project root\)"
+    print $"  (ansi green)auto_update / WT_AUTO_UPDATE(ansi reset)          Enable/disable update check \(default: true\)"
     print ""
+}
+
+# Check for updates and apply them
+export def "wt update" [] {
+    wt-update
+}
+
+# Show current wt version
+export def "wt version" [] {
+    print $"v((get-wt-version))"
 }
 
 # Create a new worktree with a typed branch (e.g. feature/name, bug/name)

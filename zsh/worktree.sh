@@ -20,6 +20,13 @@ _WT_SEARCH=$'\U0001f50d'
 # --- Configuration ---
 _WT_DEFAULT_BRANCH_TYPE="feature"
 
+_WT_VERSION="1.3.0"
+_WT_SCRIPT_DIR="${${(%):-%x}:A:h}"
+_WT_REPO_DIR="${_WT_SCRIPT_DIR:h}"
+if [[ -f "${_WT_REPO_DIR}/VERSION" ]]; then
+    _WT_VERSION="$(head -n 1 "${_WT_REPO_DIR}/VERSION" | tr -d '\r')"
+fi
+
 # Read worktree folder configuration from env var or ~/.wtconfig
 # Returns configured value on stdout and 0 if configured, 1 if not configured
 # Note: uses ${WT_WORKTREE_FOLDER+x} to distinguish unset from empty,
@@ -31,7 +38,6 @@ _wt_get_worktree_folder() {
         return 0
     fi
 
-    # Priority 2: ~/.wtconfig file
     if [[ -f "$HOME/.wtconfig" ]]; then
         local line
         while IFS= read -r line; do
@@ -291,6 +297,229 @@ _wt_get_project_layout() {
 }
 
 # ============================================================================
+# Auto-update
+# ============================================================================
+
+_wt_get_auto_update_config() {
+    if [[ ${WT_AUTO_UPDATE+x} ]]; then
+        [[ "$WT_AUTO_UPDATE" != "false" ]]
+        return $?
+    fi
+
+    # Priority 2: ~/.wtconfig file
+    if [[ -f "$HOME/.wtconfig" ]]; then
+        local line
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*auto_update[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
+                local value="${match[1]}"
+                value="${value%"${value##*[![:space:]]}"}"
+                [[ "$value" != "false" ]]
+                return $?
+            fi
+        done < "$HOME/.wtconfig"
+    fi
+
+    return 0
+}
+
+_wt_compare_version() {
+    local v1="$1" v2="$2"
+    local -a parts1 parts2
+    parts1=("${(@s:.:)v1}")
+    parts2=("${(@s:.:)v2}")
+
+    local max_len=${#parts1[@]}
+    (( ${#parts2[@]} > max_len )) && max_len=${#parts2[@]}
+
+    local i a b
+    for (( i = 1; i <= max_len; i++ )); do
+        a=${parts1[$i]:-0}
+        b=${parts2[$i]:-0}
+        (( a < b )) && { echo "-1"; return 0; }
+        (( a > b )) && { echo "1"; return 0; }
+    done
+
+    echo "0"
+}
+
+_wt_get_repo_dir() {
+    if [[ -n "$_WT_REPO_DIR" && -d "${_WT_REPO_DIR}/.git" ]]; then
+        printf '%s' "$_WT_REPO_DIR"
+        return 0
+    fi
+
+    if [[ -n "${WT_REPO_DIR:-}" && -e "$WT_REPO_DIR" ]]; then
+        printf '%s' "$WT_REPO_DIR"
+        return 0
+    fi
+
+    if [[ -f "$HOME/.wtconfig" ]]; then
+        local line
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*repo_dir[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
+                local dir="${match[1]}"
+                dir="${dir%"${dir##*[![:space:]]}"}"
+                if [[ -e "$dir" ]]; then
+                    printf '%s' "$dir"
+                    return 0
+                fi
+            fi
+        done < "$HOME/.wtconfig"
+    fi
+
+    return 1
+}
+
+_wt_get_remote_version() {
+    local repo_dir="$1"
+    local remote_branch
+
+    remote_branch=$(git -C "$repo_dir" rev-parse --abbrev-ref origin/HEAD 2>/dev/null)
+    if [[ $? -ne 0 || -z "$remote_branch" || "$remote_branch" == "origin/HEAD" ]]; then
+        local branch
+        for branch in main master; do
+            if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
+                remote_branch="origin/${branch}"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$remote_branch" ]] && return 1
+
+    local remote_version
+    remote_version=$(git -C "$repo_dir" show "${remote_branch}:VERSION" 2>/dev/null)
+    [[ $? -ne 0 || -z "$remote_version" ]] && return 1
+
+    printf '%s' "$remote_version"
+}
+
+_wt_check_update() {
+    if ! _wt_get_auto_update_config; then
+        return
+    fi
+
+    local repo_dir
+    if ! repo_dir=$(_wt_get_repo_dir); then
+        return
+    fi
+
+    local cache_file="$HOME/.wt_update_check"
+    local now
+    now=$(date +%s)
+
+    if [[ -f "$cache_file" ]]; then
+        local -a cached_lines
+        cached_lines=("${(@f)$(<"$cache_file")}")
+
+        local last_check="${cached_lines[1]:-}"
+        if [[ "$last_check" =~ ^[0-9]+$ ]] && (( now - last_check < 86400 )); then
+            local cached_version="${cached_lines[2]:-}"
+            if [[ -n "$cached_version" ]] && (( $(_wt_compare_version "$_WT_VERSION" "$cached_version") < 0 )); then
+                printf '%s\n' "$(_yellow "${_WT_WARNING} Update available: v${_WT_VERSION} → v${cached_version}. Run '${_wt_command_name} update' to update.")"
+            fi
+            return
+        fi
+    fi
+
+    git -C "$repo_dir" fetch origin --quiet &>/dev/null
+    if [[ $? -ne 0 ]]; then
+        print -r -- "$now" > "$cache_file"
+        return
+    fi
+
+    local remote_version
+    if ! remote_version=$(_wt_get_remote_version "$repo_dir"); then
+        print -r -- "$now" > "$cache_file"
+        return
+    fi
+
+    {
+        print -r -- "$now"
+        print -r -- "$remote_version"
+    } > "$cache_file"
+
+    if (( $(_wt_compare_version "$_WT_VERSION" "$remote_version") < 0 )); then
+        printf '%s\n' "$(_yellow "${_WT_WARNING} Update available: v${_WT_VERSION} → v${remote_version}. Run '${_wt_command_name} update' to update.")"
+    fi
+}
+
+_wt_update() {
+    printf '%s\n' "$(_cyan "=== Checking for updates ===")"
+    echo
+
+    local repo_dir
+    if ! repo_dir=$(_wt_get_repo_dir); then
+        printf '%s\n' "$(_red "${_WT_CROSS} Cannot determine the wt repository location")"
+        printf '%s\n' "$(_yellow "   Set the WT_REPO_DIR environment variable or add 'repo_dir = /path/to/wt' to ~/.wtconfig")"
+        return 1
+    fi
+
+    printf '%s\n' "$(_cyan "${_WT_INFO} Repository: ${repo_dir}")"
+    printf '%s\n' "$(_cyan "${_WT_INFO} Current version: v${_WT_VERSION}")"
+    echo
+
+    _wt_progress_start "Fetching latest version"
+    git -C "$repo_dir" fetch origin --quiet &>/dev/null
+    if [[ $? -ne 0 ]]; then
+        _wt_progress_complete "Failed to fetch updates (check your network connection)" "error"
+        return 1
+    fi
+    _wt_progress_complete "Fetched latest version" "success"
+
+    local remote_version
+    if ! remote_version=$(_wt_get_remote_version "$repo_dir"); then
+        printf '%s\n' "$(_red "${_WT_CROSS} Could not determine remote version")"
+        return 1
+    fi
+
+    local now
+    now=$(date +%s)
+    {
+        print -r -- "$now"
+        print -r -- "$remote_version"
+    } > "$HOME/.wt_update_check"
+
+    local comparison
+    comparison=$(_wt_compare_version "$_WT_VERSION" "$remote_version")
+    if (( comparison >= 0 )); then
+        printf '%s\n' "$(_green "${_WT_CHECK} Already up to date (v${_WT_VERSION})")"
+        return 0
+    fi
+
+    printf '%s\n' "$(_cyan "${_WT_INFO} Latest version:  v${remote_version}")"
+    echo
+    printf '%s\n' "$(_yellow "${_WT_WARNING} Updating will overwrite any manual changes you've made to the script files.")"
+    echo
+
+    read -r "response?Do you want to update? (y/N) "
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$(_red "${_WT_CROSS} Update cancelled")"
+        return 0
+    fi
+
+    _wt_progress_start "Updating scripts"
+    git -C "$repo_dir" pull &>/dev/null
+    if [[ $? -ne 0 ]]; then
+        _wt_progress_complete "Failed to pull updates" "error"
+        printf '%s\n' "$(_yellow "   You may have local changes that conflict. Resolve them in:")"
+        printf '%s\n' "$(_yellow "   ${repo_dir}")"
+        return 1
+    fi
+    _wt_progress_complete "Scripts updated to v${remote_version}" "success"
+
+    _wt_progress_start "Reloading script"
+    if source "${_WT_SCRIPT_DIR}/worktree.sh"; then
+        _wt_progress_complete "Script reloaded (v${_WT_VERSION})" "success"
+    else
+        _wt_progress_complete "Failed to reload — restart your shell to use the new version" "warning"
+    fi
+
+    echo
+    printf '%s\n' "$(_green "${_WT_CHECK} Successfully updated to v${remote_version}!")"
+}
+
+# ============================================================================
 # Help
 # ============================================================================
 
@@ -309,6 +538,8 @@ _wt_help() {
     printf '  %s           %s\n' "$(_green "fix-fetch")" "Fix fetch refspec configuration for bare repos"
     printf '  %s         %s\n' "$(_green "clone <url>")" "Clone a repo as bare and set up worktree structure"
     printf '  %s             %s\n' "$(_green "migrate")" "Migrate a classic (trees/) layout to modern (.git) layout"
+    printf '  %s              %s\n' "$(_green "update")" "Check for updates and apply them"
+    printf '  %s             %s\n' "$(_green "version")" "Show current version"
     echo
     printf '%s\n' "$(_cyan "When creating a worktree:")"
     echo "  - Branch name format: <type>/<name> (default type is 'feature')"
@@ -326,10 +557,13 @@ _wt_help() {
     printf '  %s  %s\n' "$(_yellow "${cmd} remove-all")" "# Remove all worktrees"
     printf '  %s  %s\n' "$(_yellow "${cmd} fix-fetch")" "# Fix fetch refspec configuration"
     printf '  %s  %s\n' "$(_yellow "${cmd} migrate")" "# Migrate classic layout to modern layout"
+    printf '  %s  %s\n' "$(_yellow "${cmd} update")" "# Check for updates and apply them"
+    printf '  %s  %s\n' "$(_yellow "${cmd} version")" "# Show current version"
     echo
     printf '%s\n' "$(_cyan "Configuration (~/.wtconfig or environment variables):")"
     printf '  %s  %s\n' "$(_green "command_name / WT_RENAME")" "Set custom command name"
     printf '  %s  %s\n' "$(_green "worktree_folder / WT_WORKTREE_FOLDER")" "Set worktree subfolder (default: project root)"
+    printf '  %s  %s\n' "$(_green "auto_update / WT_AUTO_UPDATE")" "Enable/disable update check (default: true)"
     echo
 }
 
@@ -1271,6 +1505,21 @@ wt() {
         return
     fi
 
+    # Handle update separately (doesn't require being inside a git repo)
+    if [[ "$cmd" == "update" ]]; then
+        _wt_update
+        return
+    fi
+
+    # Handle version separately (doesn't require being inside a git repo)
+    if [[ "$cmd" == "version" || "$cmd" == "--version" ]]; then
+        printf '%s\n' "$(_cyan "v${_WT_VERSION}")"
+        return
+    fi
+
+    # Auto-update check (throttled, silent on errors)
+    _wt_check_update
+
     # Initialize context (requires being inside a git repo)
     _wt_project_dir=$(_wt_get_git_root)
     if [[ -z "$_wt_project_dir" ]]; then
@@ -1306,6 +1555,10 @@ wt() {
         remove-all) _wt_remove_all ;;
         fix-fetch)  _wt_fix_fetch ;;
         migrate)    _wt_migrate ;;
+        update)     _wt_update ;;
+        version|--version)
+            printf '%s\n' "$(_cyan "v${_WT_VERSION}")"
+            ;;
         *)
             printf '%s\n' "$(_red "${_WT_CROSS} Error: Unknown command '${cmd}'")"
             printf '%s\n' "$(_yellow "   Run '${_wt_command_name} --help' to see available commands")"
